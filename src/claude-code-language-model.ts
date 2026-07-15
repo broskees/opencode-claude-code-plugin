@@ -197,6 +197,7 @@ export function hasNewUserContent(
 const AUTO_CONTINUE_MAX_ATTEMPTS = 8
 const AUTO_CONTINUE_MAX_ELAPSED_MS = 10 * 60 * 1000
 const AUTO_CONTINUE_NO_PROGRESS_LIMIT = 2
+const PROXY_RESULT_BOUNDARY_GRACE_MS = 250
 
 const AUTO_CONTINUE_PROMPT =
   "Continue the task from where you stopped. Do not summarize; keep working until the requested task is complete, you need clarification, or you hit a real blocker."
@@ -2068,6 +2069,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           let controllerClosed = false
           let pendingProxyUnsubscribe: (() => void) | null = null
           let resultFallbackTimer: ReturnType<typeof setTimeout> | null = null
+          let pendingResultCompletion: (() => void) | null = null
           let hasReceivedContent = false
           let visibleTextSinceContinue = ""
           let lastVisibleTextSinceContinue = ""
@@ -2188,6 +2190,34 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           finishWithToolCalls(batch)
         }
 
+        const settleResultBoundary = () => {
+          drainTimer = null
+          const completeResult = pendingResultCompletion
+          pendingResultCompletion = null
+          if (!completeResult || controllerClosed) return
+          if (drainBuffer.length > 0) {
+            drainNow()
+            return
+          }
+          completeResult()
+        }
+
+        const scheduleResultBoundary = (
+          completeResult: () => void,
+          delayMs: number,
+        ) => {
+          pendingResultCompletion = completeResult
+          if (drainTimer) clearTimeout(drainTimer)
+          drainTimer = setTimeout(settleResultBoundary, delayMs)
+        }
+
+        const noteResultBoundaryCall = (): boolean => {
+          if (!pendingResultCompletion) return false
+          if (drainTimer) clearTimeout(drainTimer)
+          drainTimer = setTimeout(settleResultBoundary, DRAIN_QUIET_MS)
+          return true
+        }
+
         const noteVisibleText = (text: string) => {
           visibleTextSinceContinue += text
           lastVisibleTextSinceContinue += text
@@ -2216,6 +2246,123 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           hadToolActivitySinceContinue = false
           hadProxyActivitySinceContinue = false
           lastStopReason = null
+        }
+
+        const completeResult = (msg: ClaudeStreamMessage) => {
+          if (controllerClosed) return
+          if (drainBuffer.length > 0) {
+            drainNow()
+            return
+          }
+
+          const orphanPending = getPendingProxyCalls(sk)
+          if (orphanPending.length > 0) {
+            log.warn(
+              "rejecting orphan pending proxy calls at turn-result boundary",
+              {
+                sessionKey: sk,
+                count: orphanPending.length,
+              },
+            )
+            rejectAllPendingProxyCallsForSession(
+              sk,
+              new Error(
+                "Claude CLI emitted result with pending proxy calls not in drain buffer",
+              ),
+            )
+          }
+
+          const autoDecision = shouldAutoContinueIncompleteTurn(
+            autoContinueState,
+            {
+              text: visibleTextSinceContinue,
+              lastVisibleText: lastVisibleTextSinceContinue,
+              hadReasoning: hadReasoningSinceContinue,
+              hadToolActivity: hadToolActivitySinceContinue,
+              hadProxyActivity: hadProxyActivitySinceContinue,
+              isError: msg.is_error,
+              stopReason: lastStopReason,
+            },
+          )
+          if (autoDecision.continue) {
+            const signature = continuationSignature({
+              text: visibleTextSinceContinue,
+              lastVisibleText: lastVisibleTextSinceContinue,
+              hadReasoning: hadReasoningSinceContinue,
+              hadToolActivity: hadToolActivitySinceContinue,
+              hadProxyActivity: hadProxyActivitySinceContinue,
+              isError: msg.is_error,
+            })
+            autoContinueState.noProgressCount =
+              signature === autoContinueState.lastSignature
+                ? autoContinueState.noProgressCount + 1
+                : 0
+            autoContinueState.lastSignature = signature
+            autoContinueState.attempts++
+            log.notice("auto-continuing incomplete claude result", {
+              sessionKey: sk,
+              reason: autoDecision.reason,
+              attempts: autoContinueState.attempts,
+              textLength: visibleTextSinceContinue.length,
+              lastTextLength: lastVisibleTextSinceContinue.length,
+              hadReasoning: hadReasoningSinceContinue,
+              hadToolActivity: hadToolActivitySinceContinue,
+              hadProxyActivity: hadProxyActivitySinceContinue,
+            })
+            turnCompleted = false
+            resetAutoContinueWindow()
+            proc.stdin?.write(makeAutoContinueMessage() + "\n")
+            return
+          }
+          log.notice("auto-continuation stopped", {
+            sessionKey: sk,
+            reason: autoDecision.reason,
+            stopReason: lastStopReason,
+            attempts: autoContinueState.attempts,
+            textLength: visibleTextSinceContinue.length,
+            lastTextLength: lastVisibleTextSinceContinue.length,
+            hadReasoning: hadReasoningSinceContinue,
+            hadToolActivity: hadToolActivitySinceContinue,
+            hadProxyActivity: hadProxyActivitySinceContinue,
+          })
+
+          for (const [idx, reasoningId] of reasoningIds) {
+            if (reasoningStarted.get(idx)) {
+              controller.enqueue({
+                type: "reasoning-end",
+                id: reasoningId,
+              } as any)
+            }
+          }
+
+          controller.enqueue({
+            type: "finish",
+            finishReason: toFinishReason("stop"),
+            usage: toUsage(msg.usage),
+            providerMetadata: {
+              "claude-code": {
+                ...resultMeta,
+                ...(compactionMode
+                  ? { compactionModel: effectiveModelId }
+                  : {}),
+              },
+              ...(typeof msg.usage?.cache_creation_input_tokens === "number"
+                ? {
+                    anthropic: {
+                      cacheCreationInputTokens:
+                        msg.usage.cache_creation_input_tokens,
+                    },
+                  }
+                : {}),
+            },
+          })
+
+          controllerClosed = true
+          cleanupTurn()
+
+          try {
+            controller.close()
+          } catch {}
         }
 
         // Set true once we observe a `stream_event` envelope. When on, the
@@ -2479,6 +2626,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   })
                   endTextBlock()
                 } else if (tc.name.startsWith(PROXY_TOOL_PREFIX)) {
+                  noteProxyActivity()
                   log.debug("ignoring proxy tool_use block; broker handles it", {
                     name: tc.name,
                     id: tc.id,
@@ -2690,6 +2838,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     })
                     endTextBlock()
                   } else if (block.name.startsWith(PROXY_TOOL_PREFIX)) {
+                    noteProxyActivity()
                     log.debug("ignoring proxy tool_use from assistant message", {
                       name: block.name,
                       id: block.id,
@@ -2874,135 +3023,46 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
 
               endTextBlock()
 
-              // Drain race / abandoned-call guard. If Claude CLI emitted
-              // `result` while a proxy tool call is still pending — either
-              // because the 100ms drain timer hasn't fired yet, or because
-              // Claude CLI gave up on its MCP HTTP request after an internal
-              // timeout — drain it through the normal tool-calls flow so
-              // opencode executes the tool; otherwise reject any orphan
-              // pending calls so proxy-mcp returns to the HTTP caller
-              // immediately instead of hanging until the broker's 10-minute
-              // timeout (which surfaces as a hard 2-minute "operation timed
-              // out" on the SDK side).
-              if (drainBuffer.length > 0) {
+              const shouldDeferResult =
+                !msg.is_error &&
+                !autoContinueState.aborted &&
+                !autoContinueState.sawAskUserQuestion
+
+              if (drainBuffer.length > 0 && shouldDeferResult) {
                 log.info(
-                  "draining pending proxy calls at turn-result boundary",
+                  "waiting for parallel proxy calls at turn-result boundary",
                   {
                     sessionKey: sk,
                     count: drainBuffer.length,
                   },
                 )
-                drainNow()
+                scheduleResultBoundary(
+                  () => completeResult(msg),
+                  DRAIN_QUIET_MS,
+                )
                 return
               }
-              const orphanPending = getPendingProxyCalls(sk)
-              if (orphanPending.length > 0) {
-                log.warn(
-                  "rejecting orphan pending proxy calls at turn-result boundary",
+
+              if (
+                drainBuffer.length === 0 &&
+                hadProxyActivitySinceContinue &&
+                shouldDeferResult
+              ) {
+                log.info(
+                  "waiting for delayed proxy call at turn-result boundary",
                   {
                     sessionKey: sk,
-                    count: orphanPending.length,
+                    graceMs: PROXY_RESULT_BOUNDARY_GRACE_MS,
                   },
                 )
-                rejectAllPendingProxyCallsForSession(
-                  sk,
-                  new Error(
-                    "Claude CLI emitted result with pending proxy calls not in drain buffer",
-                  ),
+                scheduleResultBoundary(
+                  () => completeResult(msg),
+                  PROXY_RESULT_BOUNDARY_GRACE_MS,
                 )
-              }
-
-              const autoDecision = shouldAutoContinueIncompleteTurn(
-                autoContinueState,
-                {
-                  text: visibleTextSinceContinue,
-                  lastVisibleText: lastVisibleTextSinceContinue,
-                  hadReasoning: hadReasoningSinceContinue,
-                  hadToolActivity: hadToolActivitySinceContinue,
-                  hadProxyActivity: hadProxyActivitySinceContinue,
-                  isError: msg.is_error,
-                  stopReason: lastStopReason,
-                },
-              )
-              if (autoDecision.continue) {
-                const signature = continuationSignature({
-                  text: visibleTextSinceContinue,
-                  lastVisibleText: lastVisibleTextSinceContinue,
-                  hadReasoning: hadReasoningSinceContinue,
-                  hadToolActivity: hadToolActivitySinceContinue,
-                  hadProxyActivity: hadProxyActivitySinceContinue,
-                  isError: msg.is_error,
-                })
-                autoContinueState.noProgressCount =
-                  signature === autoContinueState.lastSignature
-                    ? autoContinueState.noProgressCount + 1
-                    : 0
-                autoContinueState.lastSignature = signature
-                autoContinueState.attempts++
-                log.notice("auto-continuing incomplete claude result", {
-                  sessionKey: sk,
-                  reason: autoDecision.reason,
-                  attempts: autoContinueState.attempts,
-                  textLength: visibleTextSinceContinue.length,
-                  lastTextLength: lastVisibleTextSinceContinue.length,
-                  hadReasoning: hadReasoningSinceContinue,
-                  hadToolActivity: hadToolActivitySinceContinue,
-                  hadProxyActivity: hadProxyActivitySinceContinue,
-                })
-                turnCompleted = false
-                resetAutoContinueWindow()
-                proc.stdin?.write(makeAutoContinueMessage() + "\n")
                 return
               }
-              log.notice("auto-continuation stopped", {
-                sessionKey: sk,
-                reason: autoDecision.reason,
-                stopReason: lastStopReason,
-                attempts: autoContinueState.attempts,
-                textLength: visibleTextSinceContinue.length,
-                lastTextLength: lastVisibleTextSinceContinue.length,
-                hadReasoning: hadReasoningSinceContinue,
-                hadToolActivity: hadToolActivitySinceContinue,
-                hadProxyActivity: hadProxyActivitySinceContinue,
-              })
 
-              for (const [idx, reasoningId] of reasoningIds) {
-                if (reasoningStarted.get(idx)) {
-                  controller.enqueue({
-                    type: "reasoning-end",
-                    id: reasoningId,
-                  } as any)
-                }
-              }
-
-              controller.enqueue({
-                type: "finish",
-                finishReason: toFinishReason("stop"),
-                usage: toUsage(msg.usage),
-                providerMetadata: {
-                  "claude-code": {
-                    ...resultMeta,
-                    ...(compactionMode
-                      ? { compactionModel: effectiveModelId }
-                      : {}),
-                  },
-                  ...(typeof msg.usage?.cache_creation_input_tokens === "number"
-                    ? {
-                        anthropic: {
-                          cacheCreationInputTokens:
-                            msg.usage.cache_creation_input_tokens,
-                        },
-                      }
-                    : {}),
-                },
-              })
-
-              controllerClosed = true
-              cleanupTurn()
-
-              try {
-                controller.close()
-              } catch {}
+              completeResult(msg)
             }
           } catch (e) {
             log.debug("failed to parse line", {
@@ -3055,6 +3115,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           if (cleanedUp) return
           cleanedUp = true
           clearFallbackTimer()
+          pendingResultCompletion = null
           if (drainTimer) {
             clearTimeout(drainTimer)
             drainTimer = null
@@ -3123,6 +3184,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           noteProxyActivity()
           noteToolActivity()
           drainBuffer.push(call)
+          if (noteResultBoundaryCall()) return
           if (drainTimer) clearTimeout(drainTimer)
           drainTimer = setTimeout(drainNow, DRAIN_QUIET_MS)
         })
@@ -3140,6 +3202,18 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 "abort signal received before content, closing stream immediately",
                 { cwd },
               )
+              if (
+                drainBuffer.length > 0 ||
+                getPendingProxyCalls(sk).length > 0
+              ) {
+                rejectAllPendingProxyCallsForSession(
+                  sk,
+                  new Error(
+                    "Provider stream was aborted before pending proxy calls were emitted",
+                  ),
+                )
+                drainBuffer.length = 0
+              }
               controllerClosed = true
               cleanupTurn()
               try {

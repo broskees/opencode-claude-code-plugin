@@ -161,7 +161,7 @@ The account model IDs are internally suffixed, for example `claude-sonnet-4-6@wo
     "claude-code": {
       "options": {
         "cliPath": "claude",
-        "proxyTools": ["Bash", "Edit", "Write", "WebFetch"],
+        "proxyTools": ["Bash", "Edit", "Write", "WebFetch", "Task"],
         "skipPermissions": true,
         "permissionMode": "default",
         "bridgeOpencodeMcp": true,
@@ -179,7 +179,7 @@ The account model IDs are internally suffixed, for example `claude-sonnet-4-6@wo
 | `cwd` | string | `process.cwd()` | Working directory for the spawned CLI. Resolved **lazily per request**, so opencode's project switching works. |
 | `skipPermissions` | boolean | `true` | Pass `--dangerously-skip-permissions` to `claude`. Ignored when `proxyTools` is set — the proxy handles permissions through opencode instead. |
 | `permissionMode` | `acceptEdits` \| `auto` \| `bypassPermissions` \| `default` \| `dontAsk` \| `plan` | – | Forwarded to `claude --permission-mode`. |
-| `proxyTools` | string[] | `["Bash", "Edit", "Write", "WebFetch"]` | Claude built-in tools to route through opencode's executor + permission UI. See [Selective tool proxy](#selective-tool-proxy). |
+| `proxyTools` | string[] | `["Bash", "Edit", "Write", "WebFetch", "Task"]` | Claude built-in tools to route through opencode's executor + permission UI. See [Selective tool proxy](#selective-tool-proxy). |
 | `controlRequestBehavior` | `allow` \| `deny` | `allow` | Default response when `skipPermissions: false` and Claude sends a `can_use_tool` control request. |
 | `controlRequestToolBehaviors` | `Record<string, "allow" \| "deny">` | – | Per-tool override for `can_use_tool`. Example: `{ "Bash": "deny", "Read": "allow" }`. |
 | `controlRequestDenyMessage` | string | built-in message | Message returned to Claude on a deny. |
@@ -257,7 +257,7 @@ Set `interactiveSystemPrompt: false` only for diagnostics. While disabled, the i
 
 This is the core feature.
 
-By default, when Claude Code's CLI uses `Bash`, `Edit`, `Write`, etc., it executes them itself — bypassing opencode's permission UI, audit trail, and policy rules entirely. With `proxyTools`, you tell the plugin to disable Claude's built-in version of a tool and expose an equivalent through an in-process MCP server. Claude calls the MCP version, which blocks until opencode runs the tool through its own executor.
+By default, the plugin proxies `Bash`, `Edit`, `Write`, `WebFetch`, and `Task`. It disables Claude's corresponding built-in tool and exposes an equivalent through an in-process MCP server. Claude calls the MCP version, which blocks until opencode runs the tool through its own executor and permission system.
 
 ### Default proxied tools
 
@@ -269,11 +269,18 @@ By default, when Claude Code's CLI uses `Bash`, `Edit`, `Write`, etc., it execut
 | `"WebFetch"` | `WebFetch` | `mcp__opencode_proxy__webfetch` |
 | `"Task"` | `Agent` | `mcp__opencode_proxy__task` |
 
-The `Task` proxy is the way to let Claude orchestrate opencode's configured subagents (`build`, `general`, custom subagents defined in `opencode.json`) instead of Claude CLI's internal-only general-purpose / Explore / Plan options. With `"Task"` in `proxyTools` and `permission.task: allow` granted to the calling agent, a Claude session can invoke `task(subagent_type="build", prompt="...")` and the subagent runs natively under opencode (with its own permission UI, lifecycle, model assignment, and Tab visibility). Without `"Task"`, Claude's built-in `Agent` tool stays enabled and Claude orchestrates subagents internally with no opencode visibility.
+### OpenCode-native subagents
+
+`Task` is proxied by default. The proxy disables Claude CLI's `Agent` tool and emits an unexecuted `task` call; it does not register a replacement task tool. OpenCode's built-in TaskTool remains responsible for permission checks, creating or resuming the child session, selecting the configured subagent, and foreground/background lifecycle.
+
+- **Permissions:** the calling agent's `permission.task` rule applies to the target `subagent_type`. Grant `task: "allow"` on agents that should delegate without a prompt; an `ask` or `deny` rule remains authoritative. The plugin never bypasses this decision.
+- **Resume:** pass the child session ID back as `task_id` to continue that subagent session. Omit it to create a fresh child.
+- **Nested tasks:** current opencode defaults `subagent_depth` to `1`, so a first-level child cannot launch another child. Increase top-level `subagent_depth` to permit deeper nesting, and explicitly grant `permission.task` on every subagent that should delegate; opencode otherwise adds a task deny to spawned subagent sessions.
+- **Background:** `background: true` returns after starting the child and lets opencode notify the parent when it finishes. Current opencode requires `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` in the environment of the opencode process. Foreground is the default.
 
 Only those five values are actually proxied; anything else you put in `proxyTools` is ignored. Proxying `Edit` also disables `MultiEdit` — opencode has no batched-edit equivalent, so Claude is forced to fan out into single `Edit` calls that each flow through the permission UI.
 
-To turn off proxying entirely:
+Without `"Task"` in `proxyTools`, Claude's built-in `Agent` tool stays enabled and Claude orchestrates subagents internally with no opencode child-session visibility. To opt out of all proxying, including Task, use an explicit empty list:
 
 ```json
 "options": { "proxyTools": [] }
@@ -533,6 +540,7 @@ Workaround for autonomous compression: trigger it manually with `/dcp compress` 
 - No streaming of tool inputs as they're being constructed (Anthropic's `input_json_delta`); the plugin emits them once complete.
 - Raw chain-of-thought is not available. Claude 4 family models ship summarized thinking only. See [Extended thinking](#extended-thinking) for the full picture.
 - Recommended Claude Code CLI: **2.1.142+**. Older CLIs work for everything else but skip the `--thinking-display` flag, so Claude Opus 4.7 turns may render empty Thinking rows. If something breaks after a Claude Code update, the CLI version is the first thing to check.
+- **Foreground Task calls have a 10-minute proxy timeout.** A longer-running opencode subagent can outlive the HTTP/broker wait and surface a proxy error to Claude. For independent long work, use `background: true` after enabling opencode's experimental background-subagent flag.
 - **Subagent todos require explicit permission.** opencode's task tool gates `todowrite` per subagent: without a `permission: { todowrite: "allow" }` rule on the subagent definition, opencode injects `todowrite: false` into the tools dict and the plugin's synthetic `todowrite` emissions surface as `⚙ invalid todowrite` rows. The built-in `general` subagent denies `todowrite` by default; use a custom subagent for parallel work that needs todo visibility. Subagent todos render inline in the **subagent's** session view (navigate with the TUI's `session.child.next` / `session.parent` commands), not in the parent session's panel.
 
 ---

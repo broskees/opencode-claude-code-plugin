@@ -39,6 +39,14 @@ function pickOpencodeDirectory(input: unknown): string | undefined {
 
 let warnedAnthropicApiKey = false
 
+const DEFAULT_PROXY_TOOL_NAMES = [
+  "Bash",
+  "Edit",
+  "Write",
+  "WebFetch",
+  "Task",
+]
+
 // One-time heads-up: an API key in the environment makes Claude Code bill
 // pay-as-you-go (Console) instead of the logged-in Pro/Max subscription, which
 // silently bypasses the Agent SDK plan credit. Surfaced once per process.
@@ -72,7 +80,7 @@ export function createClaudeCode(
   const cliPath =
     settings.cliPath ?? process.env.CLAUDE_CLI_PATH ?? "claude"
   const providerName = settings.providerID ?? settings.name ?? "claude-code"
-  const proxyTools = settings.proxyTools ?? ["Bash", "Edit", "Write", "WebFetch"]
+  const proxyTools = settings.proxyTools ?? [...DEFAULT_PROXY_TOOL_NAMES]
 
   const createModel = (modelId: string): LanguageModelV3 => {
     return new ClaudeCodeLanguageModel(modelId, {
@@ -232,7 +240,7 @@ async function providerConfig(
 ) {
   const mergedOptions: Record<string, unknown> = {
     cliPath: "claude",
-    proxyTools: ["Bash", "Edit", "Write", "WebFetch"],
+    proxyTools: [...DEFAULT_PROXY_TOOL_NAMES],
     ...optionDefaults,
     ...cleanProviderOptions(existing?.options),
     providerID,

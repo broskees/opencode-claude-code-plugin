@@ -166,8 +166,9 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
       " orchestration, permission, and lifecycle are handled by opencode." +
       " Use `subagent_type` to pick which configured subagent runs (e.g." +
       " `build`, `general`, `explore`, or any custom subagent declared in" +
-      " opencode.json). The call blocks until the subagent finishes; the" +
-      " 10-minute proxy timeout applies.",
+      " opencode.json). Foreground calls block until the subagent finishes;" +
+      " set `background` to request opencode's background execution mode." +
+      " The 10-minute proxy timeout applies.",
     inputSchema: {
       type: "object",
       properties: {
@@ -194,6 +195,11 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
           type: "string",
           description: "The command that triggered this task",
         },
+        background: {
+          type: "boolean",
+          description:
+            "Run the task in the background when supported by opencode",
+        },
       },
       required: ["description", "prompt", "subagent_type"],
     },
@@ -212,6 +218,7 @@ export async function createProxyMcpServer(
       res.end()
       return
     }
+    let requestId: number | string | null = null
     try {
       const body = await readBody(req)
       const request = JSON.parse(body) as {
@@ -220,11 +227,12 @@ export async function createProxyMcpServer(
         method?: string
         params?: Record<string, unknown>
       }
+      requestId = request?.id ?? null
 
       if (request?.jsonrpc !== "2.0" || typeof request.method !== "string") {
         writeJson(res, {
           jsonrpc: "2.0",
-          id: request?.id ?? null,
+          id: requestId,
           error: { code: -32600, message: "Invalid request" },
         })
         return
@@ -238,7 +246,7 @@ export async function createProxyMcpServer(
       if (request.method === "initialize") {
         writeJson(res, {
           jsonrpc: "2.0",
-          id: request.id ?? null,
+          id: requestId,
           result: {
             protocolVersion: PROTOCOL_VERSION,
             capabilities: { tools: {} },
@@ -260,7 +268,7 @@ export async function createProxyMcpServer(
       if (request.method === "tools/list") {
         writeJson(res, {
           jsonrpc: "2.0",
-          id: request.id ?? null,
+          id: requestId,
           result: {
             tools: tools.map((t) => ({
               name: t.name,
@@ -280,7 +288,7 @@ export async function createProxyMcpServer(
         if (!tools.some((t) => t.name === toolName)) {
           writeJson(res, {
             jsonrpc: "2.0",
-            id: request.id ?? null,
+            id: requestId,
             error: {
               code: -32601,
               message: `Unknown proxy tool: ${toolName}`,
@@ -335,7 +343,7 @@ export async function createProxyMcpServer(
         if (result.kind === "error") {
           writeJson(res, {
             jsonrpc: "2.0",
-            id: request.id ?? null,
+            id: requestId,
             error: {
               code: -32000,
               message: result.message,
@@ -346,7 +354,7 @@ export async function createProxyMcpServer(
 
         writeJson(res, {
           jsonrpc: "2.0",
-          id: request.id ?? null,
+          id: requestId,
           result: {
             content: [{ type: "text", text: result.text }],
             isError: result.isError === true,
@@ -357,7 +365,7 @@ export async function createProxyMcpServer(
 
       writeJson(res, {
         jsonrpc: "2.0",
-        id: request.id ?? null,
+        id: requestId,
         error: { code: -32601, message: `Unknown method: ${request.method}` },
       })
     } catch (error) {
@@ -371,7 +379,8 @@ export async function createProxyMcpServer(
         (errorMessage.includes("timed out after") &&
           errorMessage.includes("waiting for opencode to resolve")) ||
         errorMessage.includes("rejecting as orphaned") ||
-        errorMessage.includes("was orphaned by a new user turn")
+        errorMessage.includes("was orphaned by a new user turn") ||
+        errorMessage.includes("stream was aborted")
       const logFn = isExpectedCleanup ? log.notice : log.warn
       logFn("proxy-mcp error handling request", {
         error: errorMessage,
@@ -379,7 +388,7 @@ export async function createProxyMcpServer(
       try {
         writeJson(res, {
           jsonrpc: "2.0",
-          id: null,
+          id: requestId,
           error: {
             code: -32603,
             message: error instanceof Error ? error.message : "Internal error",
