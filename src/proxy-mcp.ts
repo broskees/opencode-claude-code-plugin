@@ -49,6 +49,24 @@ export type ProxyToolResult =
   | { kind: "text"; text: string; isError?: boolean }
   | { kind: "error"; message: string }
 
+export const SERVER_CLOSED_MESSAGE = "proxy MCP server closed"
+
+/** Rejections that fire on normal lifecycle transitions: AFK-permission
+ * timeouts, orphan rejections at turn boundaries, stream aborts, and server
+ * close while its owning Claude process exits or is replaced. None are
+ * user-actionable — file-log them at NOTICE. Anything else stays WARN so
+ * genuine bugs remain visible in the TUI. */
+export function isExpectedCleanupError(message: string): boolean {
+  return (
+    (message.includes("timed out after") &&
+      message.includes("waiting for opencode to resolve")) ||
+    message.includes("rejecting as orphaned") ||
+    message.includes("was orphaned by a new user turn") ||
+    message.includes("stream was aborted") ||
+    message.includes(SERVER_CLOSED_MESSAGE)
+  )
+}
+
 const PROTOCOL_VERSION = "2024-11-05"
 const SERVER_NAME = "opencode_proxy"
 export const PROXY_TOOL_PREFIX = `mcp__${SERVER_NAME}__`
@@ -370,18 +388,7 @@ export async function createProxyMcpServer(
       })
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
-      // v0.4.13 + v0.4.19: cleanup rejections from the broker propagate up
-      // here. None are user-actionable — they fire on AFK-permission timeouts,
-      // orphan-rejections after a turn boundary, stream closes, etc. File-log
-      // them at NOTICE; other error shapes stay as WARN so genuine bugs remain
-      // visible in the TUI.
-      const isExpectedCleanup =
-        (errorMessage.includes("timed out after") &&
-          errorMessage.includes("waiting for opencode to resolve")) ||
-        errorMessage.includes("rejecting as orphaned") ||
-        errorMessage.includes("was orphaned by a new user turn") ||
-        errorMessage.includes("stream was aborted")
-      const logFn = isExpectedCleanup ? log.notice : log.warn
+      const logFn = isExpectedCleanupError(errorMessage) ? log.notice : log.warn
       logFn("proxy-mcp error handling request", {
         error: errorMessage,
       })
@@ -460,7 +467,7 @@ export async function createProxyMcpServer(
     },
     async close() {
       for (const entry of pending.values()) {
-        entry.reject(new Error("proxy MCP server closed"))
+        entry.reject(new Error(SERVER_CLOSED_MESSAGE))
       }
       pending.clear()
       await new Promise<void>((resolve) => {

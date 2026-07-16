@@ -9,6 +9,8 @@ import {
   createProxyMcpServer,
   DEFAULT_PROXY_TOOLS,
   disallowedToolFlags,
+  isExpectedCleanupError,
+  SERVER_CLOSED_MESSAGE,
 } from "./src/proxy-mcp.js"
 import {
   getPendingProxyCalls,
@@ -550,6 +552,54 @@ test("proxy MCP initializes, lists Task, and resolves it through the broker", as
     rejectAllPendingProxyCallsForSession(brokerSession, new Error("test cleanup"))
     await server.close()
   }
+})
+
+test("cleanup rejections classify as notice-level, unknown errors as warn", () => {
+  assert.equal(isExpectedCleanupError(SERVER_CLOSED_MESSAGE), true)
+  assert.equal(
+    isExpectedCleanupError(
+      "Proxy tool 'task' timed out after 600000ms waiting for opencode to resolve the call",
+    ),
+    true,
+  )
+  assert.equal(
+    isExpectedCleanupError(
+      "Pending proxy call 'task' (call-1) was orphaned by a new user turn; rejecting",
+    ),
+    true,
+  )
+  assert.equal(
+    isExpectedCleanupError(
+      "Provider stream was aborted before pending proxy calls were emitted",
+    ),
+    true,
+  )
+  assert.equal(isExpectedCleanupError("ECONNRESET"), false)
+  assert.equal(isExpectedCleanupError("Unexpected token in JSON"), false)
+})
+
+test("closing the server rejects a pending call with the cleanup message", async () => {
+  const task = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "task")
+  assert.ok(task)
+
+  const server = await createProxyMcpServer([task])
+  const callReceived = new Promise<void>((resolve) => {
+    server.calls.once("call", () => resolve())
+  })
+  const callResponse = postRpc(server.url, {
+    jsonrpc: "2.0",
+    id: "close-1",
+    method: "tools/call",
+    params: { name: "task", arguments: TASK_INPUT },
+  })
+  await callReceived
+  await server.close()
+
+  const rejected = await callResponse
+  assert.equal(rejected.body.id, "close-1")
+  assert.equal(rejected.body.error.code, -32603)
+  assert.equal(rejected.body.error.message, SERVER_CLOSED_MESSAGE)
+  assert.equal(isExpectedCleanupError(rejected.body.error.message), true)
 })
 
 test("parallel proxy calls preserve success and error correlation", async () => {
