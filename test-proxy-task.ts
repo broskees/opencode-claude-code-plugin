@@ -1,6 +1,12 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -760,16 +766,32 @@ test("immediate abort rejects a buffered Task call", async () => {
   }
 })
 
-test("parent tool-result turn resolves Task and continues the same Claude process", async () => {
+test("parent tool-result turn defers MCP hot reload and continues the same Claude process", {
+  timeout: 10_000,
+}, async () => {
   const fake = createFakeTaskCli("followup")
   const modelId = "claude-test-task-followup"
   const sk = sessionKey(fake.cwd, `${modelId}::tools::default`)
+  const configPath = join(fake.cwd, "opencode.json")
+
+  mkdirSync(join(fake.cwd, ".git"))
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      mcp: {
+        changing: {
+          type: "local",
+          command: ["node", "first-server.cjs"],
+        },
+      },
+    }),
+  )
 
   try {
     const model = createClaudeCode({
       cliPath: fake.cliPath,
       cwd: fake.cwd,
-      bridgeOpencodeMcp: false,
+      bridgeOpencodeMcp: true,
       proxyOpencodeMcpTools: false,
       proxyTools: ["Task"],
     }).languageModel(modelId)
@@ -800,6 +822,18 @@ test("parent tool-result turn resolves Task and continues the same Claude proces
     assert.ok(taskCall)
     assert.equal(taskCall.providerExecuted, false)
     assert.equal(getPendingProxyCalls(sk).length, 1)
+
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        mcp: {
+          changing: {
+            type: "local",
+            command: ["node", "second-server.cjs"],
+          },
+        },
+      }),
+    )
 
     const secondResponse = await model.doStream({
       prompt: [

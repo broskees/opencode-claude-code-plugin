@@ -1851,14 +1851,23 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             const probe = self.effectiveMcpConfig(cwd, undefined, runtimeStatus!)
             const previousHash = activeProcess.mcpHash ?? null
             if (previousHash !== probe.bridgedHash) {
-              log.info("opencode MCP config changed, respawning claude", {
-                sk,
-                previousHash,
-                currentHash: probe.bridgedHash,
-              })
-              await deleteActiveProcessAndWait(sk)
-              activeProcess = undefined
-              proxyServer = null
+              if (previousPendingProxyCalls.length > 0) {
+                log.info("deferring MCP hot reload until proxy calls resolve", {
+                  sk,
+                  previousHash,
+                  currentHash: probe.bridgedHash,
+                  pendingCalls: previousPendingProxyCalls.length,
+                })
+              } else {
+                log.info("opencode MCP config changed, respawning claude", {
+                  sk,
+                  previousHash,
+                  currentHash: probe.bridgedHash,
+                })
+                await deleteActiveProcessAndWait(sk)
+                activeProcess = undefined
+                proxyServer = null
+              }
             }
           }
 
