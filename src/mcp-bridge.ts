@@ -2,6 +2,11 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import * as os from "node:os"
 import * as crypto from "node:crypto"
+import {
+  parse as parseJsonc,
+  printParseErrorCode,
+  type ParseError,
+} from "jsonc-parser"
 import { log } from "./logger.js"
 import { pluginTmpDir } from "./tmp.js"
 
@@ -80,54 +85,18 @@ function dirExists(p: string): boolean {
   }
 }
 
-/** Strip `//` and `/* *\/` comments so JSONC parses via JSON.parse. */
-function stripJsonComments(text: string): string {
-  let out = ""
-  let i = 0
-  let inString: string | null = null
-  while (i < text.length) {
-    const c = text[i]
-    if (inString) {
-      out += c
-      if (c === "\\" && i + 1 < text.length) {
-        out += text[i + 1]
-        i += 2
-        continue
-      }
-      if (c === inString) inString = null
-      i++
-      continue
-    }
-    if (c === '"' || c === "'") {
-      inString = c
-      out += c
-      i++
-      continue
-    }
-    if (c === "/" && text[i + 1] === "/") {
-      while (i < text.length && text[i] !== "\n") i++
-      continue
-    }
-    if (c === "/" && text[i + 1] === "*") {
-      i += 2
-      while (
-        i < text.length &&
-        !(text[i] === "*" && text[i + 1] === "/")
-      )
-        i++
-      i += 2
-      continue
-    }
-    out += c
-    i++
-  }
-  return out
-}
-
 function readAndParse(file: string): Record<string, unknown> | null {
   try {
     const raw = fs.readFileSync(file, "utf8")
-    return JSON.parse(stripJsonComments(raw)) as Record<string, unknown>
+    const errors: ParseError[] = []
+    const parsed = parseJsonc(raw, errors, { allowTrailingComma: true })
+    if (errors.length > 0) {
+      const first = errors[0]
+      throw new Error(
+        `${printParseErrorCode(first.error)} at offset ${first.offset}`,
+      )
+    }
+    return parsed as Record<string, unknown>
   } catch (e) {
     log.warn("failed to parse opencode config", {
       file,

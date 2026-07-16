@@ -399,6 +399,36 @@ test("bridgeOpencodeMcp: opencode.jsonc beats opencode.json in same dir", async 
   })
 })
 
+test("bridgeOpencodeMcp: parses JSONC syntax from opencode.json", async () => {
+  await withIsolatedEnv(async (xdgRoot) => {
+    const globalDir = path.join(xdgRoot, "opencode")
+    fs.mkdirSync(globalDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(globalDir, "opencode.json"),
+      `{
+  // OpenCode accepts JSONC regardless of the config file extension.
+  "mcp": {
+    "srv": {
+      "type": "local",
+      "command": ["jsonc-server"],
+      "enabled": true,
+    },
+  },
+}`,
+    )
+
+    const repo = path.join(xdgRoot, "proj")
+    fs.mkdirSync(path.join(repo, ".git"), { recursive: true })
+    const result = bridgeOpencodeMcp(repo)
+    assert.ok(result)
+
+    const written = JSON.parse(fs.readFileSync(result.path, "utf8")) as {
+      mcpServers: Record<string, any>
+    }
+    assert.equal(written.mcpServers.srv.command, "jsonc-server")
+  })
+})
+
 test("bridgeOpencodeMcp: cwd-most project file beats parent project file", async () => {
   await withIsolatedEnv(async (xdgRoot) => {
     const repo = path.join(xdgRoot, "repo")
