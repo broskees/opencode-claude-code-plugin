@@ -37,6 +37,8 @@ const claudeSessions = new Map<string, string>()
 // one-per-chat, so an unbounded map would leak processes as users open new
 // chats. This caps at a reasonable working-set and evicts the oldest.
 const MAX_ACTIVE_PROCESSES = 16
+const PROCESS_EXIT_TIMEOUT_MS = 1_500
+const PROCESS_FORCE_EXIT_TIMEOUT_MS = 500
 
 function envFlagEnabled(value: string | undefined): boolean {
   if (value === undefined) return false
@@ -108,13 +110,71 @@ export function setActiveProcess(key: string, ap: ActiveProcess): void {
   activeProcesses.set(key, ap)
 }
 
-export function deleteActiveProcess(key: string): void {
+function detachActiveProcess(key: string): ActiveProcess | undefined {
   const ap = activeProcesses.get(key)
-  if (ap) {
-    void ap.proxyServer?.close()
-    ap.proc.kill()
-    activeProcesses.delete(key)
-  }
+  if (!ap) return undefined
+  activeProcesses.delete(key)
+  void ap.proxyServer?.close()
+  return ap
+}
+
+export function deleteActiveProcess(key: string): void {
+  const ap = detachActiveProcess(key)
+  ap?.proc.kill()
+}
+
+function hasProcessExited(proc: ChildProcess): boolean {
+  return proc.exitCode !== null || proc.signalCode !== null
+}
+
+function waitForProcessExit(
+  proc: ChildProcess,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (hasProcessExited(proc)) return Promise.resolve(true)
+
+  return new Promise((resolve) => {
+    const onExit = () => {
+      clearTimeout(timer)
+      resolve(true)
+    }
+    const timer = setTimeout(() => {
+      proc.off("exit", onExit)
+      resolve(hasProcessExited(proc))
+    }, timeoutMs)
+    proc.once("exit", onExit)
+  })
+}
+
+export async function deleteActiveProcessAndWait(
+  key: string,
+  options: {
+    exitTimeoutMs?: number
+    forceExitTimeoutMs?: number
+  } = {},
+): Promise<boolean> {
+  const ap = detachActiveProcess(key)
+  if (!ap || hasProcessExited(ap.proc)) return true
+
+  const gracefulExit = waitForProcessExit(
+    ap.proc,
+    options.exitTimeoutMs ?? PROCESS_EXIT_TIMEOUT_MS,
+  )
+  ap.proc.kill()
+  if (await gracefulExit) return true
+
+  const forcedExit = waitForProcessExit(
+    ap.proc,
+    options.forceExitTimeoutMs ?? PROCESS_FORCE_EXIT_TIMEOUT_MS,
+  )
+  ap.proc.kill("SIGKILL")
+  if (await forcedExit) return true
+
+  log.warn("claude process did not exit; starting a fresh session", {
+    sessionKey: key,
+  })
+  deleteClaudeSessionId(key)
+  return false
 }
 
 export function getClaudeSessionId(key: string): string | undefined {
@@ -182,8 +242,9 @@ export function spawnClaudeProcess(
     if (systemPromptFile) {
       void unlink(systemPromptFile).catch(() => {})
     }
-    activeProcesses.delete(sessionKey)
-    if (code !== 0 && code !== null) {
+    const ownsSessionKey = activeProcesses.get(sessionKey) === ap
+    if (ownsSessionKey) activeProcesses.delete(sessionKey)
+    if (ownsSessionKey && code !== 0 && code !== null) {
       log.info("process exited with error, clearing session", {
         code,
         sessionKey,
@@ -202,11 +263,17 @@ export function spawnClaudeProcess(
         stderr.includes("not found") ||
         stderr.includes("invalid"))
     ) {
-      log.warn("claude session ID error, clearing session", {
-        sessionKey,
-        error: stderr.slice(0, 200),
-      })
-      claudeSessions.delete(sessionKey)
+      if (activeProcesses.get(sessionKey) === ap) {
+        log.warn("claude session ID error, clearing session", {
+          sessionKey,
+          error: stderr.slice(0, 200),
+        })
+        claudeSessions.delete(sessionKey)
+      } else {
+        log.debug("ignoring session ID error from stale claude process", {
+          sessionKey,
+        })
+      }
     }
   })
 

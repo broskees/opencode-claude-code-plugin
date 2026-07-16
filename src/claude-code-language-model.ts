@@ -32,6 +32,7 @@ import {
   getClaudeSessionId,
   deleteClaudeSessionId,
   deleteActiveProcess,
+  deleteActiveProcessAndWait,
   claudeSpawnEnv,
   isClaudeThinkingDisabled,
   sessionKey,
@@ -1838,32 +1839,29 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         let lineEmitter: import("events").EventEmitter
         let proxyServer: ProxyMcpServer | null = activeProcess?.proxyServer ?? null
 
-        // Hot reload: evict cached subprocess if the bridged opencode MCP
-        // config has drifted since spawn. Only checked between turns (here,
-        // before setup() runs), never mid tool-call. The stored claude
-        // session id is preserved so the respawn resumes the conversation
-        // via `--session-id` (handled by buildCliArgs).
-        if (
-          !compactionMode &&
-          activeProcess &&
-          self.config.hotReloadMcp !== false &&
-          self.config.bridgeOpencodeMcp !== false
-        ) {
-          const probe = self.effectiveMcpConfig(cwd, undefined, runtimeStatus!)
-          const previousHash = activeProcess.mcpHash ?? null
-          if (previousHash !== probe.bridgedHash) {
-            log.info("opencode MCP config changed, respawning claude", {
-              sk,
-              previousHash,
-              currentHash: probe.bridgedHash,
-            })
-            deleteActiveProcess(sk)
-            activeProcess = undefined
-            proxyServer = null
-          }
-        }
-
         const setup = async () => {
+          // Claude locks a session ID while its process is alive. Wait for the
+          // old owner to exit before resuming that ID in the replacement.
+          if (
+            !compactionMode &&
+            activeProcess &&
+            self.config.hotReloadMcp !== false &&
+            self.config.bridgeOpencodeMcp !== false
+          ) {
+            const probe = self.effectiveMcpConfig(cwd, undefined, runtimeStatus!)
+            const previousHash = activeProcess.mcpHash ?? null
+            if (previousHash !== probe.bridgedHash) {
+              log.info("opencode MCP config changed, respawning claude", {
+                sk,
+                previousHash,
+                currentHash: probe.bridgedHash,
+              })
+              await deleteActiveProcessAndWait(sk)
+              activeProcess = undefined
+              proxyServer = null
+            }
+          }
+
           if (useInteractive && !compactionMode) {
             // Interactive Bun-ConPTY transport. Reuse the live session if one
             // exists for this key; else spawn a new interactive claude. The
