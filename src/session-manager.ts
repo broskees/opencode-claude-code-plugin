@@ -257,11 +257,15 @@ export function spawnClaudeProcess(
     const stderr = data.toString()
     log.debug("stderr", { data: stderr.slice(0, 200) })
 
+    // "No conversation found with session ID: <uuid>" is what `--resume`
+    // prints for a purged transcript — note the lowercase "session ID",
+    // which the capitalized match below does not catch.
     if (
-      stderr.includes("Session ID") &&
-      (stderr.includes("already in use") ||
-        stderr.includes("not found") ||
-        stderr.includes("invalid"))
+      stderr.includes("No conversation found") ||
+      (stderr.includes("Session ID") &&
+        (stderr.includes("already in use") ||
+          stderr.includes("not found") ||
+          stderr.includes("invalid")))
     ) {
       if (activeProcesses.get(sessionKey) === ap) {
         log.warn("claude session ID error, clearing session", {
@@ -326,10 +330,14 @@ export function buildCliArgs(opts: {
     args.push("--permission-mode", permissionMode)
   }
 
+  // `--session-id` means "create a NEW session with this UUID" and the CLI
+  // exits with "Session ID ... is already in use" whenever a transcript for
+  // that ID already exists on disk. Continuing an existing session requires
+  // `--resume` (which keeps the same session ID in print mode).
   if (includeSessionId) {
     const sessionId = claudeSessions.get(sessionKey)
     if (sessionId && !activeProcesses.has(sessionKey)) {
-      args.push("--session-id", sessionId)
+      args.push("--resume", sessionId)
     }
   }
 

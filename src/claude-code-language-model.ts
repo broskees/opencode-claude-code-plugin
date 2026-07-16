@@ -1840,8 +1840,8 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         let proxyServer: ProxyMcpServer | null = activeProcess?.proxyServer ?? null
 
         const setup = async () => {
-          // Claude locks a session ID while its process is alive. Wait for the
-          // old owner to exit before resuming that ID in the replacement.
+          // Wait for the old owner to exit before resuming its session ID in
+          // the replacement, so two processes never append to one transcript.
           if (
             !compactionMode &&
             activeProcess &&
@@ -1941,7 +1941,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             // appended system prompt, no disallowed-tools list. The model
             // is asked for text output only on a single turn — all the
             // normal tool wiring is pure overhead and adds latency.
-            // Explicitly opt out of `--session-id` so a stale id can never
+            // Explicitly opt out of `--resume` so a stale id can never
             // resume into the lean spawn.
             cliArgs = buildCliArgs({
               sessionKey: sk,

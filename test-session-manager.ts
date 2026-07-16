@@ -3,6 +3,7 @@ import { EventEmitter, once } from "node:events"
 import { test } from "node:test"
 import { spawn, type ChildProcess } from "node:child_process"
 import {
+  buildCliArgs,
   deleteActiveProcess,
   deleteActiveProcessAndWait,
   deleteClaudeSessionId,
@@ -91,6 +92,60 @@ test("deleteActiveProcessAndWait escalates before reusing a session ID", async (
     true,
   )
   assert.deepEqual(signals, ["SIGTERM", "SIGKILL"])
+})
+
+test("buildCliArgs resumes a remembered session with --resume", () => {
+  const key = "resume-args"
+  setClaudeSessionId(key, "11111111-1111-4111-8111-111111111111")
+  try {
+    const args = buildCliArgs({ sessionKey: key, skipPermissions: true })
+    assert.equal(
+      args[args.indexOf("--resume") + 1],
+      "11111111-1111-4111-8111-111111111111",
+    )
+    assert.equal(args.includes("--session-id"), false)
+  } finally {
+    deleteClaudeSessionId(key)
+  }
+})
+
+test("buildCliArgs skips --resume while the session owner is alive", () => {
+  const key = "resume-args-live"
+  setClaudeSessionId(key, "22222222-2222-4222-8222-222222222222")
+  const { activeProcess } = fakeActiveProcess({ exitOn: "SIGTERM", delayMs: 0 })
+  setActiveProcess(key, activeProcess)
+  try {
+    const args = buildCliArgs({ sessionKey: key, skipPermissions: true })
+    assert.equal(args.includes("--resume"), false)
+    assert.equal(args.includes("--session-id"), false)
+  } finally {
+    deleteActiveProcess(key)
+    deleteClaudeSessionId(key)
+  }
+})
+
+test("a resume failure on stderr clears the remembered session ID", async () => {
+  const key = "resume-error-stderr"
+  setClaudeSessionId(key, "purged-session")
+  spawnClaudeProcess(
+    process.execPath,
+    [
+      "-e",
+      "console.error('No conversation found with session ID: purged-session'); setInterval(() => {}, 1000)",
+    ],
+    process.cwd(),
+    key,
+  )
+  try {
+    const deadline = Date.now() + 2000
+    while (getClaudeSessionId(key) !== undefined && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.equal(getClaudeSessionId(key), undefined)
+  } finally {
+    deleteActiveProcess(key)
+    deleteClaudeSessionId(key)
+  }
 })
 
 test("an exiting stale process cannot delete its replacement", async () => {
