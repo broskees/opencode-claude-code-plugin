@@ -72,11 +72,10 @@ const SERVER_NAME = "opencode_proxy"
 export const PROXY_TOOL_PREFIX = `mcp__${SERVER_NAME}__`
 
 // Cap on how long a proxy tool call may wait for opencode to resolve it.
-// Matches Claude CLI's hard upper bound for Bash (10 min). Without this the
-// HTTP handler waits forever if the broker chain breaks (listener never
-// attaches, opencode crashes between turns, etc.) and the Claude
-// subprocess sits idle waiting for a tool result that never arrives.
-const PROXY_CALL_TIMEOUT_MS = 10 * 60 * 1000
+// This is also written into Claude's MCP server config; otherwise Claude's
+// remote-HTTP client aborts after its 60-second default even while an
+// opencode subagent is still running.
+export const PROXY_CALL_TIMEOUT_MS = 30 * 60 * 1000
 
 export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
   {
@@ -186,7 +185,7 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
       " `build`, `general`, `explore`, or any custom subagent declared in" +
       " opencode.json). Foreground calls block until the subagent finishes;" +
       " set `background` to request opencode's background execution mode." +
-      " The 10-minute proxy timeout applies.",
+      " The 30-minute proxy timeout applies.",
     inputSchema: {
       type: "object",
       properties: {
@@ -446,6 +445,7 @@ export async function createProxyMcpServer(
             [SERVER_NAME]: {
               type: "http",
               url,
+              timeout: PROXY_CALL_TIMEOUT_MS,
             },
           },
         },

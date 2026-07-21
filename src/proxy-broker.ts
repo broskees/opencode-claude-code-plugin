@@ -1,5 +1,9 @@
 import { EventEmitter } from "node:events"
-import type { ProxyToolCall, ProxyToolResult } from "./proxy-mcp.js"
+import {
+  PROXY_CALL_TIMEOUT_MS,
+  type ProxyToolCall,
+  type ProxyToolResult,
+} from "./proxy-mcp.js"
 import { log } from "./logger.js"
 
 export interface PendingProxyCall {
@@ -24,8 +28,6 @@ const pendingByCallId = new Map<string, InternalPending>()
 const callIdsBySession = new Map<string, Set<string>>()
 
 const emitter = new EventEmitter()
-const PENDING_PROXY_CALL_TIMEOUT_MS = 10 * 60 * 1000
-
 function eventName(sessionKey: string) {
   return `pending:${sessionKey}`
 }
@@ -79,7 +81,7 @@ export function queuePendingProxyCall(
     indexRemove(current.sessionKey, call.id)
     current.reject(
       new Error(
-        `Proxy tool call '${call.toolName}' timed out after ${PENDING_PROXY_CALL_TIMEOUT_MS}ms waiting for opencode to resolve the call`,
+        `Proxy tool call '${call.toolName}' timed out after ${PROXY_CALL_TIMEOUT_MS}ms waiting for opencode to resolve the call`,
       ),
     )
     // v0.4.13: demoted from warn to notice. AFK-permission-pending
@@ -89,9 +91,9 @@ export function queuePendingProxyCall(
       sessionKey: current.sessionKey,
       toolCallId: call.id,
       toolName: call.toolName,
-      timeoutMs: PENDING_PROXY_CALL_TIMEOUT_MS,
+      timeoutMs: PROXY_CALL_TIMEOUT_MS,
     })
-  }, PENDING_PROXY_CALL_TIMEOUT_MS)
+  }, PROXY_CALL_TIMEOUT_MS)
 
   const pending: InternalPending = {
     sessionKey,

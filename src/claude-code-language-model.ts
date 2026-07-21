@@ -2262,21 +2262,12 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             return
           }
 
-          const orphanPending = getPendingProxyCalls(sk)
-          if (orphanPending.length > 0) {
-            log.warn(
-              "rejecting orphan pending proxy calls at turn-result boundary",
-              {
-                sessionKey: sk,
-                count: orphanPending.length,
-              },
-            )
-            rejectAllPendingProxyCallsForSession(
-              sk,
-              new Error(
-                "Claude CLI emitted result with pending proxy calls not in drain buffer",
-              ),
-            )
+          const pendingSiblings = getPendingProxyCalls(sk)
+          if (pendingSiblings.length > 0) {
+            log.info("leaving parallel proxy calls pending at result boundary", {
+              sessionKey: sk,
+              count: pendingSiblings.length,
+            })
           }
 
           const autoDecision = shouldAutoContinueIncompleteTurn(
@@ -3242,9 +3233,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           // Tool-result turn: the prompt carries opencode's results for the
           // proxy tool calls we drained on the previous turn. Resolve each
           // matched call (claude CLI's HTTP handlers wake up and continue).
-          // Any pending calls without a matching tool-result are orphans
-          // (rare protocol anomaly); reject them so claude CLI doesn't hang
-          // on those HTTP requests.
+          // Parallel tools may complete in separate opencode turns. Keep
+          // unmatched siblings pending until their own result, an explicit
+          // abort/new user turn, or the proxy deadline.
           for (const { call, result } of previousPendingProxyMatches) {
             if (result) {
               log.info("resolving pending proxy call from tool result prompt", {
@@ -3254,19 +3245,13 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               })
               resolvePendingProxyCallById(call.toolCallId, result)
             } else {
-              log.notice(
-                "pending proxy call had no matching tool-result; rejecting as orphan",
+              log.info(
+                "leaving unmatched parallel proxy call pending",
                 {
                   sessionKey: sk,
                   toolCallId: call.toolCallId,
                   toolName: call.toolName,
                 },
-              )
-              rejectPendingProxyCallById(
-                call.toolCallId,
-                new Error(
-                  `Pending proxy call '${call.toolName}' (${call.toolCallId}) was not matched in tool-result turn; rejecting as orphaned`,
-                ),
               )
             }
           }

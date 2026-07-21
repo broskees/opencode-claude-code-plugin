@@ -4,6 +4,7 @@ import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs"
@@ -16,6 +17,7 @@ import {
   DEFAULT_PROXY_TOOLS,
   disallowedToolFlags,
   isExpectedCleanupError,
+  PROXY_CALL_TIMEOUT_MS,
   SERVER_CLOSED_MESSAGE,
 } from "./src/proxy-mcp.js"
 import {
@@ -499,6 +501,13 @@ test("proxy MCP initializes, lists Task, and resolves it through the broker", as
   const forwardCall = (call: any) => queuePendingProxyCall(brokerSession, call)
   server.calls.on("call", forwardCall)
   try {
+    const generatedConfig = JSON.parse(readFileSync(server.configPath(), "utf8"))
+    assert.equal(
+      generatedConfig.mcpServers.opencode_proxy.timeout,
+      30 * 60 * 1000,
+    )
+    assert.equal(PROXY_CALL_TIMEOUT_MS, 30 * 60 * 1000)
+
     const initialized = await postRpc(server.url, {
       jsonrpc: "2.0",
       id: "initialize-1",
@@ -564,7 +573,7 @@ test("cleanup rejections classify as notice-level, unknown errors as warn", () =
   assert.equal(isExpectedCleanupError(SERVER_CLOSED_MESSAGE), true)
   assert.equal(
     isExpectedCleanupError(
-      "Proxy tool 'task' timed out after 600000ms waiting for opencode to resolve the call",
+      "Proxy tool 'task' timed out after 1800000ms waiting for opencode to resolve the call",
     ),
     true,
   )
@@ -823,6 +832,23 @@ test("parent tool-result turn defers MCP hot reload and continues the same Claud
     assert.equal(taskCall.providerExecuted, false)
     assert.equal(getPendingProxyCalls(sk).length, 1)
 
+    let unmatchedRejected = false
+    const unmatchedToolCallId = "parallel-task-still-running"
+    queuePendingProxyCall(sk, {
+      id: unmatchedToolCallId,
+      toolName: "task",
+      input: {
+        description: "Parallel sibling",
+        prompt: "Keep running until a later tool-result turn.",
+        subagent_type: "explore",
+      },
+      resolve() {},
+      reject() {
+        unmatchedRejected = true
+      },
+    })
+    assert.equal(getPendingProxyCalls(sk).length, 2)
+
     writeFileSync(
       configPath,
       JSON.stringify({
@@ -874,7 +900,11 @@ test("parent tool-result turn defers MCP hot reload and continues the same Claud
     const finishes = secondParts.filter((part) => part.type === "finish")
     assert.equal(finishes.length, 1)
     assert.equal(finishes[0].finishReason.unified, "stop")
-    assert.equal(getPendingProxyCalls(sk).length, 0)
+    assert.equal(unmatchedRejected, false)
+    assert.deepEqual(
+      getPendingProxyCalls(sk).map((call) => call.toolCallId),
+      [unmatchedToolCallId],
+    )
   } finally {
     rejectAllPendingProxyCallsForSession(sk, new Error("test cleanup"))
     deleteActiveProcess(sk)
