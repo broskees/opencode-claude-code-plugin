@@ -187,6 +187,7 @@ The account model IDs are internally suffixed, for example `claude-sonnet-4-6@wo
 | `controlRequestToolBehaviors` | `Record<string, "allow" \| "deny">` | – | Per-tool override for `can_use_tool`. Example: `{ "Bash": "deny", "Read": "allow" }`. |
 | `controlRequestDenyMessage` | string | built-in message | Message returned to Claude on a deny. |
 | `bridgeOpencodeMcp` | boolean | `true` | Auto-translate your opencode `mcp` block into Claude's `--mcp-config`. See [MCP bridge](#mcp-bridge). |
+| `bridgeOpencodeSkills` | boolean | `true` | Expose your opencode skills to Claude's native Skill tool. See [Skill bridge](#skill-bridge). |
 | `mcpConfig` | string \| string[] | – | Extra `--mcp-config` paths/JSON passed alongside the bridged config. |
 | `strictMcpConfig` | boolean | `false` | Pass `--strict-mcp-config` so Claude loads **only** the configured servers and ignores `~/.claude/settings.json`. |
 | `webSearch` | `"claude"` \| `"disabled"` \| `<tool>` | `"claude"` | Routing for Claude's built-in `WebSearch`. See [WebSearch routing](#websearch-routing). |
@@ -270,17 +271,20 @@ By default, the plugin proxies `Bash`, `Edit`, `Write`, `WebFetch`, and `Task`. 
 | `"Edit"` | `Edit`, `MultiEdit` | `mcp__opencode_proxy__edit` |
 | `"Write"` | `Write` | `mcp__opencode_proxy__write` |
 | `"WebFetch"` | `WebFetch` | `mcp__opencode_proxy__webfetch` |
-| `"Task"` | `Agent` | `mcp__opencode_proxy__task` |
+| `"Task"` | `Agent` | `mcp__opencode_proxy__task`, `mcp__opencode_proxy__task_batch` |
 | `"Question"` | `AskUserQuestion` | `mcp__opencode_proxy__question` |
 
 ### OpenCode-native subagents
 
-`Task` is proxied by default. The proxy disables Claude CLI's `Agent` tool and emits an unexecuted `task` call; it does not register a replacement task tool. OpenCode's built-in TaskTool remains responsible for permission checks, creating or resuming the child session, selecting the configured subagent, and foreground/background lifecycle.
+`Task` is proxied by default. The proxy disables Claude CLI's `Agent` tool and emits unexecuted `task` calls; it does not register a replacement task tool. OpenCode's built-in TaskTool remains responsible for permission checks, creating or resuming child sessions, selecting configured subagents, and foreground/background lifecycle.
 
 - **Permissions:** the calling agent's `permission.task` rule applies to the target `subagent_type`. Grant `task: "allow"` on agents that should delegate without a prompt; an `ask` or `deny` rule remains authoritative. The plugin never bypasses this decision.
 - **Resume:** pass the child session ID back as `task_id` to continue that subagent session. Omit it to create a fresh child.
 - **Nested tasks:** current opencode defaults `subagent_depth` to `1`, so a first-level child cannot launch another child. Increase top-level `subagent_depth` to permit deeper nesting, and explicitly grant `permission.task` on every subagent that should delegate; opencode otherwise adds a task deny to spawned subagent sessions.
 - **Background:** `background: true` returns after starting the child and lets opencode notify the parent when it finishes. Current opencode requires `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` in the environment of the opencode process. Foreground is the default.
+- **Concurrent tasks:** Claude CLI serializes separate MCP task requests even when the model emits them together. For two or more independent subagents, the plugin exposes `task_batch`: Claude makes one MCP call containing a `tasks` array, the provider fans it out into multiple OpenCode `task` calls in one tool boundary, and their results are aggregated into the single MCP response.
+
+Each fanned-out call uses an id shaped like `<parent>_task_<index>`. Those ids intentionally contain only `[A-Za-z0-9_-]`: OpenCode normalizes other separators before the next provider turn, so the original colon-separated ids could no longer be matched to their completed results and Claude saw a successful batch as interrupted.
 
 **Steering models to it.** Headless Claude Code CLIs expose no `Agent`/`Task`
 dispatch tool of their own (verified on 2.1.211), while they *do* expose
@@ -375,6 +379,10 @@ The `task` and `question` defaults are deliberately generous. Subagents routinel
 }
 ```
 
+### Long-running proxy connections
+
+A proxied call holds its HTTP response open while opencode runs the tool. Node and Claude CLI's undici client used to cut these connections off at exactly five minutes through their 300-second header/body timeouts, even when the per-tool deadline was longer. The proxy now flushes response headers as soon as the call is registered and sends a keepalive byte every 60 seconds, so the configured `proxyToolTimeoutMs` deadline remains the actual limit.
+
 ---
 
 ## WebSearch routing
@@ -396,6 +404,32 @@ Claude Code ships a built-in `WebSearch` tool. The `webSearch` option controls w
 - Claude-side execution: free with your Claude usage, no API key, but no opencode visibility into queries/results, no caching/rate-limit hooks.
 - opencode-side execution: choose any backend, queries flow through opencode's audit/policy/cache, but costs money (search APIs are paid) and adds a network hop.
 - Some Claude-specific tool features stay on the built-in side (notably `MultiEdit` — see the note above).
+
+---
+
+## Skill bridge
+
+opencode and Claude Code use the same on-disk skill format — a `<name>/SKILL.md` file whose YAML frontmatter carries `name` and `description` — but they read from different directories. opencode looks in `.opencode/skills/` and `~/.config/opencode/skills/`; the Claude CLI looks in `~/.claude/skills/` and its own plugins. Without a bridge, opencode still advertises your skills in the system prompt it forwards, so Claude calls the Skill tool and gets `Unknown skill`.
+
+If `bridgeOpencodeSkills` is true (the default), the plugin discovers your opencode skills, stages a throwaway Claude Code plugin directory that links them, and passes it as `claude --plugin-dir`. They then register natively, prefixed with the plugin name:
+
+```
+opencode-skills:browser-automation
+opencode-skills:crop-image
+```
+
+Claude can invoke them with the Skill tool or as `/opencode-skills:<name>`. `--plugin-dir` is scoped to the spawned session, so nothing is written into your `~/.claude`.
+
+### Discovery order (first match wins)
+
+1. `.opencode/skills/` walking up from the working directory (nearest first)
+2. `~/.opencode/skills/`
+3. `$OPENCODE_CONFIG_DIR/skills/`
+4. `~/.config/opencode/skills/` (or `$XDG_CONFIG_HOME/opencode/skills/`)
+
+A project-level skill therefore shadows a global one of the same name. Directories without a `SKILL.md` are ignored. If the skill set is unchanged, the staged directory is reused rather than rebuilt on each spawn.
+
+Set `bridgeOpencodeSkills: false` to turn this off. It also no-ops automatically when you have no opencode skills, on the compaction path, or when your Claude CLI is too old to support `--plugin-dir` (the plugin probes `claude --help` rather than assuming a version, and logs a notice if the flag is missing).
 
 ---
 
@@ -441,8 +475,17 @@ Each chat keeps a long-lived `claude` subprocess so the model retains its native
 - **Same chat, multiple turns** → process reused, full Claude context retained.
 - **New chat** → fresh process under the new session key.
 - **Resumed chat after restart** → in-memory state is gone; a new process spawns and the conversation history is summarized and prepended.
-- **Abort (Ctrl+C)** → stream closes, process stays alive for the next message in that chat.
-- **Cap**: 16 active processes, LRU eviction.
+- **Abort (Esc / Ctrl+C)** → the plugin sends the Claude CLI a stream-json `interrupt` control request, so the CLI actually stops generating and running tools. The process stays alive for the next message in that chat.
+- **Cleanup**: idle processes are reaped after 30 minutes, processes for a known chat are released when that session is deleted, and all children are killed when opencode exits. Reaping is transparent because the next turn resumes the stored Claude session in a fresh process.
+- **Cap**: 8 active processes, with LRU eviction as a burst backstop.
+
+### One turn at a time
+
+The Claude CLI serves a single turn per process, so the plugin tracks whether a turn is still in flight and never writes a new user message into a busy stdin. If a turn is somehow still running when the next one starts, it is interrupted first (5s cap, then the plugin proceeds anyway and logs it).
+
+Without that guard, an aborted turn kept running: it billed tokens after you stopped it, its leftover output streamed into your *next* message's reply, and its `result` closed that reply's stream before the real answer arrived — so a message sent right after an abort looked ignored. Tool-result turns are exempt from the guard, since there the CLI is legitimately parked inside a proxied tool call waiting on opencode.
+
+The idle reaper never kills a turn in flight. Its timer is unref'd so process cleanup cannot keep opencode itself alive.
 
 ---
 

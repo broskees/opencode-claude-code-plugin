@@ -14,6 +14,11 @@ import {
 import { cleanupStaleUnscopedInstall } from "./cleanup-stale.js"
 import { configureLogger, log } from "./logger.js"
 import {
+  deleteActiveProcessesForAffinity,
+  killAllActiveProcesses,
+  startIdleProcessReaper,
+} from "./session-manager.js"
+import {
   isUsableDirectory,
   setOpencodeClient,
   setOpencodeProjectDirectory,
@@ -106,6 +111,7 @@ export function createClaudeCode(
       mcpConfig: settings.mcpConfig,
       strictMcpConfig: settings.strictMcpConfig,
       bridgeOpencodeMcp: settings.bridgeOpencodeMcp ?? true,
+      bridgeOpencodeSkills: settings.bridgeOpencodeSkills ?? true,
       controlRequestBehavior: settings.controlRequestBehavior ?? "allow",
       controlRequestToolBehaviors: settings.controlRequestToolBehaviors,
       controlRequestDenyMessage: settings.controlRequestDenyMessage,
@@ -354,8 +360,25 @@ async function expandAccountProviders(config: {
   return expandedCount > 0
 }
 
+let processLifecycleWired = false
+
+/**
+ * Claude CLI processes are reused across turns and only ever released by LRU
+ * pressure, so a user who opens several chats and walks away keeps every one
+ * of them (~250 MB each) alive indefinitely. Arm the idle reaper, and make
+ * sure a shutdown does not reparent live CLIs to init.
+ */
+function wireProcessLifecycle(): void {
+  if (processLifecycleWired) return
+  processLifecycleWired = true
+
+  startIdleProcessReaper()
+  process.on("exit", killAllActiveProcesses)
+}
+
 const server: OpenCodePlugin = async (input) => {
   cleanupStaleUnscopedInstall()
+  wireProcessLifecycle()
 
   const opencodeVersion = pickOpencodeVersion(input)
 
@@ -401,10 +424,30 @@ const server: OpenCodePlugin = async (input) => {
         opencodeVersion,
       )
     },
-    // No `event` hook: MCP config drift is detected at turn start by the
-    // hot-reload check in `claude-code-language-model.ts`, which respawns
-    // claude safely between turns. Eviction on `global.disposed` would kill
-    // an in-flight stream and abort the user's current turn.
+    // Only `session.deleted` is acted on. MCP config drift is still detected
+    // at turn start by the hot-reload check in `claude-code-language-model.ts`,
+    // which respawns claude safely between turns, and eviction on
+    // `global.disposed` would kill an in-flight stream and abort the user's
+    // current turn. A deleted session has no turn left to abort, and its CLI
+    // process would otherwise linger until LRU pressure evicted it.
+    event: async ({ event }) => {
+      const payload = event?.payload ?? event
+      if (payload?.type !== "session.deleted") return
+
+      const properties = payload.properties as
+        | { info?: { id?: unknown }; sessionID?: unknown }
+        | undefined
+      const sessionID = properties?.info?.id ?? properties?.sessionID
+      if (typeof sessionID !== "string" || !sessionID) return
+
+      const released = deleteActiveProcessesForAffinity(sessionID)
+      if (released.length > 0) {
+        log.info("released claude processes for deleted session", {
+          sessionID,
+          released,
+        })
+      }
+    },
     provider: {
       id: PROVIDER_ID,
       models: async (provider) => defaultModelsForProvider(provider.models),

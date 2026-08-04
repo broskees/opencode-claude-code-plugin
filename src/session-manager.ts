@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process"
 import { createInterface } from "node:readline"
+import { randomUUID } from "node:crypto"
 import { EventEmitter } from "node:events"
 import { unlink } from "node:fs/promises"
 import { log } from "./logger.js"
@@ -24,6 +25,18 @@ export interface ActiveProcess {
   mcpHash?: string | null
   /** Temp file holding `--append-system-prompt-file` content; unlinked on exit. */
   systemPromptFile?: string
+  /**
+   * True for the Bun-PTY interactive transport, whose `stdin.write` types
+   * into a TUI rather than speaking stream-json. Interrupting one means
+   * sending a keystroke, not a control request — see `interruptTurn`.
+   */
+  interactive?: boolean
+  /**
+   * Epoch ms of the last turn that needed this process. Stamped on spawn and
+   * refreshed by `touch()`, so it tracks "last time a chat used this CLI",
+   * not "last byte on the wire". Drives `reapIdleProcesses`.
+   */
+  lastUsedAt?: number
 }
 
 // One active CLI process per session key. Keyed by a composite
@@ -36,9 +49,24 @@ const claudeSessions = new Map<string, string>()
 // Cap on live CLI subprocesses. Session-affinity-keyed entries accumulate
 // one-per-chat, so an unbounded map would leak processes as users open new
 // chats. This caps at a reasonable working-set and evicts the oldest.
-const MAX_ACTIVE_PROCESSES = 16
+//
+// Keep this modest: an idle `claude --print` holds ~250 MB resident, so the
+// old cap of 16 let a single opencode instance sit on ~4 GB of chats nobody
+// had touched in a day. The idle reaper below is what does the real work;
+// this is only the backstop for a burst of chats inside one TTL window.
+const MAX_ACTIVE_PROCESSES = 8
+
+// LRU pressure alone never reaps: a user who opens 8 chats and walks away
+// keeps 8 CLI processes alive indefinitely. Idle processes are cheap to drop
+// because the Claude session id lives in `claudeSessions`, not on the
+// process — the next turn respawns with `--resume` and full continuity.
+const IDLE_PROCESS_TTL_MS = 30 * 60_000
+const IDLE_SWEEP_INTERVAL_MS = 5 * 60_000
 const PROCESS_EXIT_TIMEOUT_MS = 1_500
 const PROCESS_FORCE_EXIT_TIMEOUT_MS = 500
+// An interrupted turn reports back in milliseconds. This bound only matters
+// when the CLI is wedged, and we proceed anyway once it lapses.
+export const TURN_INTERRUPT_TIMEOUT_MS = 5_000
 
 function envFlagEnabled(value: string | undefined): boolean {
   if (value === undefined) return false
@@ -83,9 +111,137 @@ export function claudeSpawnEnv(opts?: {
   return env
 }
 
+// ---------------------------------------------------------------------------
+// Turn lifecycle
+//
+// The Claude CLI runs exactly one turn at a time. Writing a user message while
+// a turn is still in flight does NOT start a new turn: the CLI queues the
+// message, keeps streaming the old turn's output onto the same stdout, and
+// emits the OLD turn's `result` first. Whoever is listening then attributes
+// the old turn's tail to the new turn and closes on the wrong `result` — the
+// new message's real answer arrives after the stream is gone.
+//
+// That is exactly what an abort used to leave behind, because closing our end
+// of the stream never told the CLI anything. So: every stdin write that starts
+// work announces itself via `noteTurnStarted`, a permanent line listener marks
+// the process idle again on the CLI's terminal `result`, and `interruptTurn`
+// makes an abort actually abort.
+
+interface TurnTracker {
+  inFlight: boolean
+  waiters: Array<() => void>
+}
+
+const turnTrackers = new WeakMap<ActiveProcess, TurnTracker>()
+
+/** Cheap pre-filter before JSON.parse — every CLI stdout line hits this. */
+function isTerminalResultLine(line: string): boolean {
+  if (!line.includes('"result"')) return false
+  try {
+    return (JSON.parse(line) as { type?: string }).type === "result"
+  } catch {
+    return false
+  }
+}
+
+function turnTracker(ap: ActiveProcess): TurnTracker {
+  const existing = turnTrackers.get(ap)
+  if (existing) return existing
+
+  const tracker: TurnTracker = { inFlight: false, waiters: [] }
+  turnTrackers.set(ap, tracker)
+
+  const settle = () => {
+    tracker.inFlight = false
+    for (const wake of tracker.waiters.splice(0)) wake()
+  }
+
+  // Permanent, deliberately independent of whichever turn currently owns the
+  // stream. A `result` that lands after its turn detached — the abort case —
+  // still marks the CLI idle instead of leaking into the next turn's handler.
+  ap.lineEmitter.on("line", (line: string) => {
+    if (!tracker.inFlight) return
+    if (isTerminalResultLine(line)) settle()
+  })
+  ap.lineEmitter.on("close", settle)
+
+  return tracker
+}
+
+/** Call immediately before any stdin write that asks the CLI to do work. */
+export function noteTurnStarted(ap: ActiveProcess): void {
+  turnTracker(ap).inFlight = true
+}
+
+export function isTurnInFlight(ap: ActiveProcess): boolean {
+  return turnTracker(ap).inFlight
+}
+
+/** Resolves true once the CLI is idle, false if it stayed busy past the timeout. */
+export function awaitTurnIdle(
+  ap: ActiveProcess,
+  timeoutMs: number,
+): Promise<boolean> {
+  const tracker = turnTracker(ap)
+  if (!tracker.inFlight) return Promise.resolve(true)
+
+  return new Promise((resolve) => {
+    const wake = () => {
+      clearTimeout(timer)
+      resolve(true)
+    }
+    const timer = setTimeout(() => {
+      const at = tracker.waiters.indexOf(wake)
+      if (at >= 0) tracker.waiters.splice(at, 1)
+      resolve(false)
+    }, timeoutMs)
+    tracker.waiters.push(wake)
+  })
+}
+
+/**
+ * Ask the CLI to abandon the in-flight turn, and wait for it to say it did.
+ *
+ * The CLI answers a stream-json `control_request` of subtype `interrupt` by
+ * aborting the turn and emitting a terminal `result` with
+ * `subtype: "error_during_execution"` almost immediately — so this normally
+ * resolves in milliseconds.
+ */
+export function interruptTurn(
+  ap: ActiveProcess,
+  timeoutMs = TURN_INTERRUPT_TIMEOUT_MS,
+): Promise<boolean> {
+  if (!turnTracker(ap).inFlight) return Promise.resolve(true)
+
+  // The interactive transport's stdin is a TUI, not a protocol endpoint —
+  // a control request would be typed in as literal JSON. Wait it out instead.
+  if (ap.interactive) {
+    log.notice("interactive transport cannot be interrupted; waiting for turn")
+    return awaitTurnIdle(ap, timeoutMs)
+  }
+
+  try {
+    ap.proc.stdin?.write(
+      JSON.stringify({
+        type: "control_request",
+        request_id: randomUUID(),
+        request: { subtype: "interrupt" },
+      }) + "\n",
+    )
+  } catch (error) {
+    log.warn("failed to write interrupt control request", {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return Promise.resolve(false)
+  }
+
+  return awaitTurnIdle(ap, timeoutMs)
+}
+
 function touch(key: string): void {
   const existing = activeProcesses.get(key)
   if (existing) {
+    existing.lastUsedAt = Date.now()
     activeProcesses.delete(key)
     activeProcesses.set(key, existing)
   }
@@ -107,6 +263,7 @@ export function getActiveProcess(key: string): ActiveProcess | undefined {
 }
 
 export function setActiveProcess(key: string, ap: ActiveProcess): void {
+  ap.lastUsedAt = Date.now()
   activeProcesses.set(key, ap)
 }
 
@@ -177,6 +334,94 @@ export async function deleteActiveProcessAndWait(
   return false
 }
 
+/**
+ * Drop CLI processes no chat has used in `ttlMs`. A turn still in flight is
+ * always spared — `lastUsedAt` is stamped at turn *start*, so a long-running
+ * turn would otherwise look idle and get killed mid-answer.
+ *
+ * Returns the reaped session keys (for tests and logging).
+ */
+export function reapIdleProcesses(
+  ttlMs: number = IDLE_PROCESS_TTL_MS,
+  now: number = Date.now(),
+): string[] {
+  const reaped: string[] = []
+
+  for (const [key, ap] of [...activeProcesses]) {
+    if (isTurnInFlight(ap)) continue
+
+    // A process that predates stamping (or an ActiveProcess shim built
+    // elsewhere) starts its clock now rather than being reaped immediately.
+    if (ap.lastUsedAt === undefined) {
+      ap.lastUsedAt = now
+      continue
+    }
+
+    const idleMs = now - ap.lastUsedAt
+    if (idleMs < ttlMs) continue
+
+    log.info("reaping idle claude process", { sessionKey: key, idleMs })
+    void deleteActiveProcessAndWait(key)
+    reaped.push(key)
+  }
+
+  return reaped
+}
+
+let idleSweepTimer: ReturnType<typeof setInterval> | null = null
+
+/** Idempotent. The timer is unref'd so it never holds opencode open. */
+export function startIdleProcessReaper(): void {
+  if (idleSweepTimer) return
+  idleSweepTimer = setInterval(() => {
+    reapIdleProcesses()
+  }, IDLE_SWEEP_INTERVAL_MS)
+  idleSweepTimer.unref?.()
+}
+
+/** Test-only. Stops the sweep so a test process can exit deterministically. */
+export function stopIdleProcessReaper(): void {
+  if (!idleSweepTimer) return
+  clearInterval(idleSweepTimer)
+  idleSweepTimer = null
+}
+
+/**
+ * Release every CLI process belonging to one opencode chat, for `session.deleted`.
+ *
+ * Session keys are `cwd::model::scope::affinity` (see `sessionKey`), so the
+ * affinity token is the trailing segment. `"default"` is the shared fallback
+ * bucket used when no session id is known — matching on it would kill another
+ * live chat's process, so it is deliberately skipped.
+ */
+export function deleteActiveProcessesForAffinity(affinity: string): string[] {
+  if (!affinity || affinity === "default") return []
+
+  const suffix = `::${affinity}`
+  const released: string[] = []
+
+  for (const key of [...activeProcesses.keys()]) {
+    if (!key.endsWith(suffix)) continue
+    log.info("releasing claude process for ended session", { sessionKey: key })
+    void deleteActiveProcessAndWait(key)
+    deleteClaudeSessionId(key)
+    released.push(key)
+  }
+
+  return released
+}
+
+/**
+ * Synchronous best-effort sweep for process exit. Node does not kill children
+ * on exit, so without this a hard opencode shutdown reparents every live
+ * `claude` to init. Must stay sync — `process.on("exit")` runs no async work.
+ */
+export function killAllActiveProcesses(): void {
+  for (const key of [...activeProcesses.keys()]) {
+    deleteActiveProcess(key)
+  }
+}
+
 export function getClaudeSessionId(key: string): string | undefined {
   return claudeSessions.get(key)
 }
@@ -227,6 +472,7 @@ export function spawnClaudeProcess(
     proxyServer: proxyServer ?? null,
     mcpHash,
     systemPromptFile,
+    lastUsedAt: Date.now(),
   }
   activeProcesses.set(sessionKey, ap)
 
@@ -368,6 +614,7 @@ export function buildCliArgs(opts: {
   permissionMode?: string
   mcpConfig?: string | string[]
   strictMcpConfig?: boolean
+  pluginDirs?: string[]
   disallowedTools?: string[]
   appendSystemPromptFile?: string
   thinking?: "enabled" | "disabled"
@@ -382,6 +629,7 @@ export function buildCliArgs(opts: {
     permissionMode,
     mcpConfig,
     strictMcpConfig,
+    pluginDirs,
     disallowedTools,
     appendSystemPromptFile,
     thinking,
@@ -427,6 +675,15 @@ export function buildCliArgs(opts: {
 
   if (strictMcpConfig) {
     args.push("--strict-mcp-config")
+  }
+
+  // `--plugin-dir` is repeatable and scoped to this session only. Callers
+  // pass an already-validated list (see skill-bridge.ts), which is empty
+  // whenever the CLI is too old to accept the flag.
+  if (pluginDirs && pluginDirs.length > 0) {
+    for (const dir of pluginDirs) {
+      args.push("--plugin-dir", dir)
+    }
   }
 
   if (disallowedTools && disallowedTools.length > 0) {

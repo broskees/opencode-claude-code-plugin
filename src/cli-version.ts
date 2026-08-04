@@ -85,7 +85,41 @@ export function cliSupportsThinking(v: CliVersion | null): boolean {
   return gte(v, { major: 2, minor: 0, patch: 0 })
 }
 
+const flagSupport = new Map<string, Promise<boolean>>()
+
+/**
+ * Probe whether the binary's own `--help` mentions a flag. Used for flags
+ * with no published version marker (`--plugin-dir`), where pinning an
+ * invented semver threshold would just be a guess. Costs one `--help` spawn
+ * per cliPath+flag, cached for the process lifetime. Any failure → false, so
+ * the caller skips the flag rather than risking a parse error on spawn.
+ */
+export function detectCliSupportsFlag(cliPath: string, flag: string): Promise<boolean> {
+  const key = `${cliPath}\x00${flag}`
+  const cached = flagSupport.get(key)
+  if (cached) return cached
+  const promise = (async (): Promise<boolean> => {
+    try {
+      const { stdout } = await execFileAsync(cliPath, ["--help"], {
+        timeout: 5000,
+        maxBuffer: 4 * 1024 * 1024,
+      })
+      return stdout.includes(flag)
+    } catch (err) {
+      log.warn("failed to probe claude cli flag support", {
+        cliPath,
+        flag,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      return false
+    }
+  })()
+  flagSupport.set(key, promise)
+  return promise
+}
+
 /** For tests. */
 export function _clearCache(): void {
   cache.clear()
+  flagSupport.clear()
 }

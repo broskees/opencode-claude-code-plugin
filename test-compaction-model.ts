@@ -111,3 +111,36 @@ test("headless prompt path still preserves forwarded opencode system prompt", ()
     rmSync(tmp, { recursive: true, force: true })
   }
 })
+
+test("task batch hint overrides generic parallel tool-call guidance", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "opencode-cc-test-"))
+  const previousConfigHome = process.env.XDG_CONFIG_HOME
+  let promptFile: string | undefined
+
+  try {
+    process.env.XDG_CONFIG_HOME = join(tmp, "config")
+    promptFile = buildAppendedSystemPrompt(
+      tmp,
+      true,
+      ["Emit multiple task calls in one response."],
+      true,
+    )
+    assert.ok(promptFile)
+    const content = readFileSync(promptFile, "utf8")
+
+    assert.match(content, /Concurrent opencode subagents/)
+    assert.match(content, /MUST use one `task_batch` call/)
+    assert.ok(
+      content.indexOf("Concurrent opencode subagents") >
+        content.indexOf("Emit multiple task calls"),
+    )
+  } finally {
+    if (promptFile) unlinkSync(promptFile)
+    if (previousConfigHome === undefined) {
+      delete process.env.XDG_CONFIG_HOME
+    } else {
+      process.env.XDG_CONFIG_HOME = previousConfigHome
+    }
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})

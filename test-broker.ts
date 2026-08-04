@@ -285,3 +285,48 @@ test("queuePendingProxyCall with a duplicate callId replaces the old entry clean
 
   rejectAllPendingProxyCallsForSession(sk, new Error("cleanup"))
 })
+
+test("queuePendingProxyCall with timeout 0 never expires the call", async () => {
+  const sessionKey = "broker-no-timeout"
+  let settled: string | null = null
+  const call: ProxyToolCall = {
+    id: "no-timeout-1",
+    toolName: "task",
+    input: {},
+    resolve: (r: ProxyToolResult) => {
+      settled = r.kind === "text" ? r.text : "error"
+    },
+    reject: () => {
+      settled = "rejected"
+    },
+  }
+
+  const pending = queuePendingProxyCall(sessionKey, call, 0)
+  assert.equal(pending.timer, null, "no deadline should be armed")
+
+  await new Promise((r) => setTimeout(r, 120))
+  assert.equal(settled, null, "call must still be waiting")
+
+  resolvePendingProxyCallById("no-timeout-1", { kind: "text", text: "late" })
+  assert.equal(settled, "late")
+})
+
+test("queuePendingProxyCall still honours an explicit deadline", async () => {
+  const sessionKey = "broker-short-timeout"
+  const rejected = new Promise<Error>((resolve) => {
+    queuePendingProxyCall(
+      sessionKey,
+      {
+        id: "short-1",
+        toolName: "task",
+        input: {},
+        resolve: () => {},
+        reject: resolve,
+      },
+      40,
+    )
+  })
+
+  const err = await rejected
+  assert.match(err.message, /timed out after 40ms/)
+})

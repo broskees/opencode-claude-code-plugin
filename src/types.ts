@@ -24,6 +24,7 @@ export interface ClaudeCodeConfig {
   mcpConfig?: string | string[]
   strictMcpConfig?: boolean
   bridgeOpencodeMcp?: boolean
+  bridgeOpencodeSkills?: boolean
   controlRequestBehavior?: ControlRequestBehavior
   controlRequestToolBehaviors?: Record<string, ControlRequestBehavior>
   controlRequestDenyMessage?: string
@@ -99,6 +100,16 @@ export interface ClaudeCodeProviderSettings {
    * the same MCP servers opencode is configured with.
    */
   bridgeOpencodeMcp?: boolean
+  /**
+   * Expose skills found in opencode's skill directories
+   * (`.opencode/skills/` walking up from cwd, then `~/.opencode/skills/`,
+   * `OPENCODE_CONFIG_DIR/skills/`, and `~/.config/opencode/skills/`) to the
+   * Claude CLI's native Skill tool, via a session-scoped `--plugin-dir`.
+   * They register as `opencode-skills:<name>`. Defaults to `true`: opencode
+   * already advertises these skills in the system prompt it forwards, so
+   * without the bridge the model calls `Skill` and gets `Unknown skill`.
+   */
+  bridgeOpencodeSkills?: boolean
   /**
    * Behavior for Claude CLI `control_request` permission checks
    * (`subtype: can_use_tool`) when `skipPermissions` is false.

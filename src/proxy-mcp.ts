@@ -50,6 +50,8 @@ export type ProxyToolResult =
   | { kind: "error"; message: string }
 
 export const SERVER_CLOSED_MESSAGE = "proxy MCP server closed"
+export const CLIENT_GONE_MESSAGE =
+  "Claude CLI hung up before the proxy call resolved"
 
 /** Rejections that fire on normal lifecycle transitions: AFK-permission
  * timeouts, orphan rejections at turn boundaries, stream aborts, and server
@@ -63,6 +65,7 @@ export function isExpectedCleanupError(message: string): boolean {
     message.includes("rejecting as orphaned") ||
     message.includes("was orphaned by a new user turn") ||
     message.includes("stream was aborted") ||
+    message.includes(CLIENT_GONE_MESSAGE) ||
     message.includes(SERVER_CLOSED_MESSAGE)
   )
 }
@@ -76,8 +79,8 @@ export const PROXY_TOOL_PREFIX = `mcp__${SERVER_NAME}__`
 // effective deadline is resolved per tool — see `resolveProxyCallTimeoutMs`.
 export const PROXY_DEFAULT_TIMEOUT_MS = 10 * 60 * 1000
 
-// Per-tool default deadlines, keyed by lowercase proxy tool name. `task`
-// dispatches an opencode subagent that routinely runs 20-40 min; the old
+// Per-tool default deadlines, keyed by lowercase proxy tool name. `task` and
+// `task_batch` dispatch opencode subagents that routinely run 20-40 min; the old
 // flat ceiling fired mid-subagent, made Claude believe its dispatch had
 // failed, and (because the proxy had already returned a timeout error) the
 // late subagent result was dropped on the floor -- the operator had to
@@ -90,6 +93,7 @@ export const PROXY_DEFAULT_TIMEOUT_MS = 10 * 60 * 1000
 // matches the "prefer fewer, high-signal questions" guidance in the def.
 export const PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS: Record<string, number> = {
   task: 60 * 60 * 1000, // 60 min
+  task_batch: 60 * 60 * 1000, // 60 min
   question: 30 * 60 * 1000, // 30 min
 }
 
@@ -177,7 +181,7 @@ export function resolveProxyClientCeilingMs(
 export function buildProxyTimeoutError(toolName: string, ms: number): Error {
   const key = toolName.toLowerCase()
   const base = `Proxy tool '${toolName}' timed out after ${ms}ms waiting for opencode to resolve the call`
-  if (key === "task") {
+  if (key === "task" || key === TASK_BATCH_TOOL_NAME) {
     return new Error(
       base +
         " (the subagent). The subagent may still be running but its result" +
@@ -200,13 +204,14 @@ export function buildProxyTimeoutError(toolName: string, ms: number): Error {
  * Both failure modes are addressed here, at the tool the model reads.
  */
 export const TASK_PROXY_NOTE =
-  "This is the ONLY tool that dispatches opencode subagents (including" +
+  "The task and task_batch proxies are the ONLY tools that dispatch opencode" +
+  " subagents (including" +
   " user @-mentions). Claude Code's built-in TaskCreate/TaskUpdate manage" +
   " a local todo list and cannot dispatch subagents. Do not search config" +
   " files to verify a subagent type exists — invalid types fail fast with" +
   " a clear error. Foreground calls block until the subagent finishes; set" +
-  " `background` to request opencode's background execution mode. Task calls" +
-  " get a 60-minute proxy deadline by default (configurable via" +
+  " `background` to request opencode's background execution mode. Task and" +
+  " task_batch calls get a 60-minute proxy deadline by default (configurable via" +
   " proxyToolTimeoutMs)."
 
 const AGENT_TYPES_HEADING = "Available agent types"
@@ -331,6 +336,62 @@ export function filterQuestionProxyByOpencodeSupport(
   return tools.filter((t) => t.name !== "question")
 }
 
+// Keepalive cadence for an open proxy call. Must stay comfortably under
+// undici's 300s body timeout; see the long-poll comment in `tools/call`.
+export const PROXY_HEARTBEAT_MS = 60 * 1000
+
+export const TASK_BATCH_TOOL_NAME = "task_batch"
+
+const TASK_INPUT_PROPERTIES = {
+  description: {
+    type: "string",
+    description: "A short (3-5 words) description of the task",
+  },
+  prompt: {
+    type: "string",
+    description: "The task for the agent to perform",
+  },
+  subagent_type: {
+    type: "string",
+    description: "The type of specialized agent to use for this task",
+  },
+  task_id: {
+    type: "string",
+    description:
+      "Set this only if you mean to resume a previous task — pass the" +
+      " prior task_id to continue the same subagent session instead of" +
+      " creating a fresh one.",
+  },
+  command: {
+    type: "string",
+    description: "The command that triggered this task",
+  },
+  background: {
+    type: "boolean",
+    description: "Run the task in the background when supported by opencode",
+  },
+}
+
+const TASK_INPUT_REQUIRED = ["description", "prompt", "subagent_type"]
+
+function taskBatchInputError(input: Record<string, unknown>): string | null {
+  if (!Array.isArray(input.tasks) || input.tasks.length < 2) {
+    return "task_batch requires a tasks array with at least two items"
+  }
+  for (const [index, task] of input.tasks.entries()) {
+    if (task === null || typeof task !== "object" || Array.isArray(task)) {
+      return `task_batch tasks[${index}] must be an object`
+    }
+    const item = task as Record<string, unknown>
+    for (const field of TASK_INPUT_REQUIRED) {
+      if (typeof item[field] !== "string") {
+        return `task_batch tasks[${index}].${field} must be a string`
+      }
+    }
+  }
+  return null
+}
+
 export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
   {
     name: "bash",
@@ -437,41 +498,40 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
       " orchestration, permission, and lifecycle are handled by opencode." +
       " Use `subagent_type` to pick which configured subagent runs (e.g." +
       " `build`, `general`, `explore`, or any custom subagent declared in" +
-      " opencode.json). " +
+      " opencode.json)." +
+      " For two or more independent subagents, use task_batch instead of" +
+      " emitting multiple task calls; Claude Code executes MCP calls" +
+      " serially, while task_batch fans them out concurrently in opencode. " +
       TASK_PROXY_NOTE,
     inputSchema: {
       type: "object",
+      properties: TASK_INPUT_PROPERTIES,
+      required: TASK_INPUT_REQUIRED,
+    },
+  },
+  {
+    name: TASK_BATCH_TOOL_NAME,
+    description:
+      "Launch two or more independent opencode subagents concurrently." +
+      " Put one ordinary task input in `tasks` for each subagent. This is" +
+      " the required concurrency path: make one task_batch call rather than" +
+      " multiple task calls in the same response. The plugin fans the array" +
+      " out as parallel opencode task calls and returns all results together.",
+    inputSchema: {
+      type: "object",
       properties: {
-        description: {
-          type: "string",
-          description: "A short (3-5 words) description of the task",
-        },
-        prompt: {
-          type: "string",
-          description: "The task for the agent to perform",
-        },
-        subagent_type: {
-          type: "string",
-          description: "The type of specialized agent to use for this task",
-        },
-        task_id: {
-          type: "string",
-          description:
-            "Set this only if you mean to resume a previous task — pass the" +
-            " prior task_id to continue the same subagent session instead of" +
-            " creating a fresh one.",
-        },
-        command: {
-          type: "string",
-          description: "The command that triggered this task",
-        },
-        background: {
-          type: "boolean",
-          description:
-            "Run the task in the background when supported by opencode",
+        tasks: {
+          type: "array",
+          minItems: 2,
+          description: "Independent subagent tasks to execute concurrently",
+          items: {
+            type: "object",
+            properties: TASK_INPUT_PROPERTIES,
+            required: TASK_INPUT_REQUIRED,
+          },
         },
       },
-      required: ["description", "prompt", "subagent_type"],
+      required: ["tasks"],
     },
   },
   {
@@ -640,12 +700,58 @@ export async function createProxyMcpServer(
           return
         }
 
+        if (toolName === TASK_BATCH_TOOL_NAME) {
+          const validationError = taskBatchInputError(input)
+          if (validationError) {
+            writeJson(res, {
+              jsonrpc: "2.0",
+              id: requestId,
+              result: {
+                content: [{ type: "text", text: validationError }],
+                isError: true,
+              },
+            })
+            return
+          }
+        }
+
         const callId = crypto.randomUUID()
         log.info("proxy-mcp tool call received", {
           callId,
           toolName,
           hasInput: input != null,
         })
+
+        // This response is a long poll: it stays open until opencode resolves
+        // the call, which for a `task` subagent is routinely many minutes.
+        //
+        // HTTP clients give up long before our budget. undici — which backs
+        // both Node's `fetch` and the Claude CLI's MCP client — aborts at
+        // `headersTimeout` (300s) with UND_ERR_HEADERS_TIMEOUT, and at
+        // `bodyTimeout` (also 300s) between body chunks. No MCP config field
+        // or CLI env var lifts either: they fire client-side, below all of it.
+        // Claude surfaces the abort as "The operation timed out." at 5:00
+        // sharp, decides the proxy is broken, and ends the turn while
+        // opencode is still running the subagent.
+        //
+        // So: flush headers now (stops the header timer), then dribble a
+        // space periodically (stops the body timer). Whitespace before a JSON
+        // value is insignificant per RFC 8259, so the payload we send at the
+        // end still parses. Chunked encoding — no Content-Length — is what
+        // lets us write the body in pieces. flushHeaders() is load-bearing:
+        // writeHead() alone only stages the headers, so without it nothing
+        // reaches the wire until the first heartbeat.
+        res.writeHead(200, { "Content-Type": "application/json" })
+        res.flushHeaders()
+        const heartbeat = setInterval(() => {
+          if (res.writableEnded) return
+          try {
+            res.write(" ")
+          } catch {
+            // Client hung up; the close handler below settles the call.
+          }
+        }, PROXY_HEARTBEAT_MS)
+        heartbeat.unref?.()
 
         let timer: ReturnType<typeof setTimeout> | null = null
         const result = await new Promise<ProxyToolResult>(
@@ -658,6 +764,27 @@ export async function createProxyMcpServer(
               reject,
             }
             pending.set(callId, entry)
+
+            // Liveness beats the clock: when the CLI hangs up — its own
+            // request aborted, the turn interrupted — the socket closes and
+            // we release the call now instead of holding it to the deadline.
+            // `writableEnded` distinguishes that from our own normal finish.
+            res.on("close", () => {
+              if (res.writableEnded) return
+              if (!pending.has(callId)) return
+              pending.delete(callId)
+              log.notice("proxy client hung up before the call resolved", {
+                callId,
+                toolName,
+              })
+              // The broker holds its own entry for this call; tell it to drop
+              // that too, rather than leaving a stale one for the orphan
+              // sweep. Emitted rather than called directly to keep proxy-mcp
+              // free of a dependency on proxy-broker.
+              calls.emit("cancel", { id: callId, toolName })
+              reject(new Error(`${CLIENT_GONE_MESSAGE}: ${toolName}`))
+            })
+
             const deadlineMs = resolveProxyCallTimeoutMs(
               toolName,
               input,
@@ -681,6 +808,7 @@ export async function createProxyMcpServer(
           },
         ).finally(() => {
           if (timer) clearTimeout(timer)
+          clearInterval(heartbeat)
           pending.delete(callId)
         })
 
@@ -755,6 +883,13 @@ export async function createProxyMcpServer(
       }
     }
   })
+
+  // Node's default `requestTimeout` is 5 minutes, which would kill the socket
+  // out from under a long call. Per-tool timers above own the deadline.
+  //
+  // Slowloris protection is not a concern here: this server binds to an
+  // ephemeral 127.0.0.1 port and serves exactly one local Claude CLI.
+  server.requestTimeout = 0
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject)
@@ -853,6 +988,7 @@ export function disallowedToolFlags(tools: ProxyToolDef[]): string[] {
     grep: ["Grep"],
     webfetch: ["WebFetch"],
     task: ["Agent"],
+    task_batch: ["Agent"],
     // `question` disables Claude Code's built-in `AskUserQuestion` so the
     // structured-questions path flows through opencode's native `question`
     // tool instead — same UI/permission/audit benefits as the other
@@ -885,6 +1021,13 @@ function readBody(req: IncomingMessage): Promise<string> {
 
 function writeJson(res: ServerResponse, body: unknown): void {
   const payload = JSON.stringify(body)
+  // A long-poll response has already flushed its headers and some keepalive
+  // whitespace (see the heartbeat in tools/call). Finish the body instead of
+  // throwing ERR_HTTP_HEADERS_SENT.
+  if (res.headersSent) {
+    res.end(payload)
+    return
+  }
   res.statusCode = 200
   res.setHeader("Content-Type", "application/json")
   res.setHeader("Content-Length", Buffer.byteLength(payload).toString())

@@ -13,6 +13,9 @@ export interface InteractiveSpawnOptions {
   model?: string
   /** Bridged Claude `--mcp-config` file paths (from effectiveMcpConfig). */
   mcpConfigPaths?: string[]
+  /** Session-scoped `--plugin-dir` paths (from resolveSkillPluginDirs), which
+   *  expose opencode skills to the TUI's native Skill tool. */
+  pluginDirs?: string[]
   /** permissions.allow rules (e.g. mcp__server__*, Bash, Edit). */
   permissionsAllow?: string[]
   /** Optional permission mode. `bypassPermissions` is ignored for interactive
@@ -102,6 +105,11 @@ export function spawnInteractiveProcess(
       ...opts.mcpConfigPaths,
       "--strict-mcp-config",
     )
+  }
+  if (opts.pluginDirs && opts.pluginDirs.length > 0) {
+    for (const dir of opts.pluginDirs) {
+      extraArgs.push("--plugin-dir", dir)
+    }
   }
   if (opts.permissionsAllow && opts.permissionsAllow.length > 0) {
     extraArgs.push(
@@ -257,5 +265,6 @@ export function spawnInteractiveProcess(
     proxyServer: null,
     mcpHash: undefined,
     systemPromptFile: opts.systemPromptFile,
+    interactive: true,
   }
 }

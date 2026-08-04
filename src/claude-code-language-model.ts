@@ -18,6 +18,7 @@ import { mapTool, isWebSearchTool, isWebSearchHandledByCli } from "./tool-mappin
 import { applyTaskCreateToolResult } from "./todo-ledger.js"
 import { getClaudeUserMessage } from "./message-builder.js"
 import { bridgeOpencodeMcp, type RuntimeMcpStatus } from "./mcp-bridge.js"
+import { resolveSkillPluginDirs } from "./skill-bridge.js"
 import {
   getRuntimeMcpStatus,
   fetchOpencodeToolList,
@@ -37,6 +38,9 @@ import {
   claudeSpawnEnv,
   isClaudeThinkingDisabled,
   sessionKey,
+  noteTurnStarted,
+  isTurnInFlight,
+  interruptTurn,
 } from "./session-manager.js"
 import { spawnInteractiveProcess } from "./claude-session-wrapper.js"
 import { log } from "./logger.js"
@@ -49,6 +53,8 @@ import {
   overlayQuestionProxyDescription,
   filterQuestionProxyByOpencodeSupport,
   PROXY_TOOL_PREFIX,
+  TASK_BATCH_TOOL_NAME,
+  CLIENT_GONE_MESSAGE,
   type ProxyMcpServer,
   type ProxyToolCall,
   type ProxyToolDef,
@@ -199,10 +205,29 @@ export function hasNewUserContent(
   return false
 }
 
+function taskBatchTasks(input: Record<string, unknown>): Record<string, unknown>[] {
+  if (!Array.isArray(input.tasks)) return []
+  if (
+    input.tasks.some(
+      (task) => task === null || typeof task !== "object" || Array.isArray(task),
+    )
+  ) {
+    return []
+  }
+  return input.tasks as Record<string, unknown>[]
+}
+
+function taskBatchChildToolCallId(parentToolCallId: string, index: number): string {
+  // AI SDK provider bridges normalize unsupported tool-id characters. Keep
+  // this identifier stable across the OpenCode -> provider round trip.
+  return `${parentToolCallId}_task_${index}`
+}
+
 const AUTO_CONTINUE_MAX_ATTEMPTS = 8
 const AUTO_CONTINUE_MAX_ELAPSED_MS = 10 * 60 * 1000
 const AUTO_CONTINUE_NO_PROGRESS_LIMIT = 2
 const PROXY_RESULT_BOUNDARY_GRACE_MS = 250
+const PROXY_INCOMPLETE_BATCH_GRACE_MS = 2_000
 
 const AUTO_CONTINUE_PROMPT =
   "Continue the task from where you stopped. Do not summarize; keep working until the requested task is complete, you need clarification, or you hit a real blocker."
@@ -535,6 +560,15 @@ when the task is done, you need clarification on intent, or you hit a real
 blocker. The user can interrupt or abort at any time; turn endings should
 mark meaningful checkpoints, not every completed substep.`
 
+const TASK_BATCH_HINT = `## Concurrent opencode subagents
+
+When the \`task_batch\` tool is available, you MUST use one \`task_batch\` call
+for two or more independent subagents. Put each ordinary task input in its
+\`tasks\` array. Do not emit multiple \`task\` calls for concurrency in this
+runtime: Claude Code executes those MCP requests serially, while \`task_batch\`
+fans them out concurrently inside opencode. Instructions elsewhere to put
+parallel task calls in one response are satisfied here by one \`task_batch\` call.`
+
 /**
  * Appended to the system prompt whenever the `task` proxy tool is
  * enabled. Live sessions (2026-07-04) showed models resolving opencode's
@@ -627,6 +661,7 @@ export function buildAppendedSystemPrompt(
   cwd: string,
   includeMultiStepHint = true,
   extraSystemContent: string[] = [],
+  includeTaskBatchHint = false,
 ): string | undefined {
   const parts: string[] = []
   parts.push(CLAUDE_CLI_CONTEXT_NOTE)
@@ -642,6 +677,7 @@ export function buildAppendedSystemPrompt(
   if (workspaceAgents && workspaceAgents !== globalAgents) parts.push(workspaceAgents)
   if (globalAgents || workspaceAgents) parts.push(AGENTS_MAINTENANCE_HINT)
   if (includeMultiStepHint) parts.push(MULTI_STEP_TASK_HINT)
+  if (includeTaskBatchHint) parts.push(TASK_BATCH_HINT)
 
   const content = parts.join("\n\n")
   if (!content) return undefined
@@ -766,9 +802,20 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       DEFAULT_PROXY_TOOLS.map((t) => [t.name.toLowerCase(), t]),
     )
     const picked: ProxyToolDef[] = []
+    const seen = new Set<string>()
     for (const n of names) {
       const def = defsByName.get(String(n).toLowerCase())
-      if (def) picked.push(def)
+      if (def && !seen.has(def.name)) {
+        picked.push(def)
+        seen.add(def.name)
+      }
+      if (def?.name === "task") {
+        const batch = defsByName.get(TASK_BATCH_TOOL_NAME)
+        if (batch && !seen.has(batch.name)) {
+          picked.push(batch)
+          seen.add(batch.name)
+        }
+      }
     }
     return picked.length > 0 ? picked : null
   }
@@ -870,10 +917,18 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     srv.calls.on("call", (call: ProxyToolCall) => {
       queuePendingProxyCall(sessionKeyForCalls, call, timeoutOverrides)
     })
+    // The CLI hung up on a call still in flight — drop the broker's entry too
+    // so it can't linger until the orphan sweep on the next user turn.
+    srv.calls.on("cancel", ({ id, toolName }: { id: string; toolName: string }) => {
+      rejectPendingProxyCallById(
+        id,
+        new Error(`${CLIENT_GONE_MESSAGE}: ${toolName}`),
+      )
+    })
     return srv
   }
 
-  private extractPendingProxyResult(
+  private extractToolResult(
     prompt: LanguageModelV3CallOptions["prompt"],
     toolCallId: string,
   ): ProxyToolResult | null {
@@ -896,6 +951,20 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           return {
             kind: "text",
             text: String(output.value ?? ""),
+          }
+        }
+
+        if (output.type === "error-text") {
+          return {
+            kind: "error",
+            message: String(output.value ?? "Tool execution failed"),
+          }
+        }
+
+        if (output.type === "error-json") {
+          return {
+            kind: "error",
+            message: JSON.stringify(output.value),
           }
         }
 
@@ -925,6 +994,59 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     }
 
     return null
+  }
+
+  private extractPendingProxyResult(
+    prompt: LanguageModelV3CallOptions["prompt"],
+    call: PendingProxyCall,
+  ): ProxyToolResult | null {
+    if (call.toolName !== TASK_BATCH_TOOL_NAME) {
+      return this.extractToolResult(prompt, call.toolCallId)
+    }
+
+    const tasks = taskBatchTasks(call.input)
+    if (tasks.length === 0) {
+      return {
+        kind: "error",
+        message: "task_batch requires at least one valid task object",
+      }
+    }
+
+    const results = tasks.map((task, index) => ({
+      task,
+      result: this.extractToolResult(
+        prompt,
+        taskBatchChildToolCallId(call.toolCallId, index),
+      ),
+    }))
+    const completedCount = results.filter(({ result }) => result !== null).length
+    if (completedCount === 0) return null
+    if (completedCount !== results.length) {
+      return {
+        kind: "error",
+        message:
+          `task_batch received ${completedCount} of ${results.length} child` +
+          " results in one provider turn; OpenCode must settle every task in" +
+          " the shared tool boundary before returning results",
+      }
+    }
+
+    return {
+      kind: "text",
+      text: JSON.stringify(
+        {
+          results: results.map(({ task, result }, index) => ({
+            index,
+            description: String(task.description ?? `Task ${index + 1}`),
+            isError: result!.kind === "error" || result!.isError === true,
+            output:
+              result!.kind === "error" ? result!.message : result!.text,
+          })),
+        },
+        null,
+        2,
+      ),
+    }
   }
 
   /**
@@ -1380,9 +1502,14 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     // doGenerate always spawns a fresh process, never reuse session ID.
     // Pre-fetch opencode's MCP runtime status so the bridge overlays
     // UI-toggled state on top of disk config.
-    const [runtimeStatus, cliVersion] = await Promise.all([
+    const [runtimeStatus, cliVersion, skillPluginDirs] = await Promise.all([
       getRuntimeMcpStatus(),
       detectCliVersion(this.config.cliPath),
+      resolveSkillPluginDirs({
+        cwd,
+        cliPath: this.config.cliPath,
+        enabled: this.config.bridgeOpencodeSkills !== false,
+      }),
     ])
     const systemPromptFile = buildAppendedSystemPrompt(
       cwd,
@@ -1397,6 +1524,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       permissionMode: this.config.permissionMode,
       mcpConfig: this.effectiveMcpConfig(cwd, undefined, runtimeStatus).paths,
       strictMcpConfig: this.config.strictMcpConfig,
+      pluginDirs: skillPluginDirs,
       disallowedTools:
         this.config.webSearch === "disabled" ? ["WebSearch"] : undefined,
       appendSystemPromptFile: systemPromptFile,
@@ -1873,7 +2001,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       result: ProxyToolResult | null
     }> = previousPendingProxyCalls.map((call) => ({
       call,
-      result: this.extractPendingProxyResult(options.prompt, call.toolCallId),
+      result: this.extractPendingProxyResult(options.prompt, call),
     }))
     const hasMatchedPendingResults = previousPendingProxyMatches.some(
       (m) => m.result !== null,
@@ -1885,9 +2013,18 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     // the SDK client routes through `Server.app.fetch` (no socket).
     // Detect the Claude CLI version in parallel so the spawn can decide
     // which optional flags it supports without crashing older binaries.
-    const [runtimeStatus, cliVersion] = await Promise.all([
+    // Compaction takes the lean spawn, so it skips the skill bridge along
+    // with the rest of the tool wiring.
+    const [runtimeStatus, cliVersion, skillPluginDirs] = await Promise.all([
       compactionMode ? Promise.resolve(undefined) : getRuntimeMcpStatus(),
       detectCliVersion(this.config.cliPath),
+      compactionMode
+        ? Promise.resolve<string[]>([])
+        : resolveSkillPluginDirs({
+            cwd,
+            cliPath: this.config.cliPath,
+            enabled: this.config.bridgeOpencodeSkills !== false,
+          }),
     ])
 
     log.info("doStream starting", {
@@ -1989,6 +2126,10 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                       // showed that large forwarded payload can trigger Claude
                       // Code's third-party-app usage gate, while our static
                       // CLI/AGENTS/continuation prompt remains safe.
+                      [],
+                      resolvedProxy?.some(
+                        (tool) => tool.name === TASK_BATCH_TOOL_NAME,
+                      ) === true,
                     )
               if (self.config.interactiveSystemPrompt === false) {
                 log.warn(
@@ -2006,6 +2147,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 configDir: self.config.configDir,
                 model: effectiveModelId,
                 mcpConfigPaths: mcp.paths,
+                pluginDirs: skillPluginDirs,
                 permissionsAllow: allow,
                 systemPromptFile,
                 ignoreAnthropicApiKey: self.config.ignoreAnthropicApiKey,
@@ -2182,6 +2324,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     ...(taskProxyEnabled ? [SUBAGENT_DISPATCH_HINT] : []),
                     ...(questionProxyActive ? [QUESTION_PROXY_HINT] : []),
                   ],
+                  enrichedProxy?.some(
+                    (tool) => tool.name === TASK_BATCH_TOOL_NAME,
+                  ) === true,
                 )
             cliArgs = buildCliArgs({
               sessionKey: sk,
@@ -2190,6 +2335,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               permissionMode: self.config.permissionMode,
               mcpConfig: mcp.paths,
               strictMcpConfig: self.config.strictMcpConfig,
+              pluginDirs: skillPluginDirs,
               disallowedTools: allDisallowed.length > 0 ? allDisallowed : undefined,
               appendSystemPromptFile: systemPromptFile,
               ...self.thinkingCliOptions(),
@@ -2219,6 +2365,30 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             lineEmitter = ap.lineEmitter
             activeProcess = ap
           }
+          }
+
+          // The CLI serves one turn at a time. If the previous one is still
+          // running — the user aborted it, or it ended on our inactivity
+          // fallback rather than a real `result` — stop it before this turn
+          // attaches any listeners. Otherwise its tail streams into us and
+          // its `result` closes us before our own answer arrives.
+          //
+          // Skipped for tool-result turns: there the CLI is deliberately
+          // parked inside a proxy MCP call waiting for the result we're about
+          // to deliver, so "in flight" is correct and interrupting would kill
+          // the tool call we came here to complete.
+          if (activeProcess && !hasMatchedPendingResults) {
+            const busyProcess = activeProcess
+            if (isTurnInFlight(busyProcess)) {
+              log.warn("previous turn still in flight; interrupting it", { sk })
+              const idle = await interruptTurn(busyProcess)
+              if (!idle) {
+                log.warn(
+                  "previous turn did not stop in time; this turn may see stale output",
+                  { sk },
+                )
+              }
+            }
           }
 
           controller.enqueue({ type: "stream-start", warnings })
@@ -2420,31 +2590,52 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             usage?: ClaudeStreamMessage["usage"]
           } = {}
 
-        // Batched drain so claude CLI's parallel tool_use blocks (e.g. two
-        // bash calls in one assistant message) end up in a single
-        // tool-calls finish event. Without this, the broker would reject
-        // every overlapping call and claude would see spurious tool errors.
+        // Claude can stream large parallel tool inputs many seconds apart.
+        // Hold proxy calls until the assistant message is complete, then use
+        // the short quiet period only to absorb MCP scheduling jitter.
         const drainBuffer: PendingProxyCall[] = []
+        const proxyToolUseIds = new Set<string>()
+        let assistantMessageStopped = false
         let drainTimer: ReturnType<typeof setTimeout> | null = null
+        let incompleteBatchTimer: ReturnType<typeof setTimeout> | null = null
         const DRAIN_QUIET_MS = 100
 
         const finishWithToolCalls = (calls: PendingProxyCall[]) => {
           if (controllerClosed) return
           if (calls.length === 0) return
-          for (const call of calls) {
+          const enqueueToolCall = (
+            toolCallId: string,
+            toolName: string,
+            input: Record<string, unknown>,
+          ) => {
             controller.enqueue({
               type: "tool-input-start",
-              id: call.toolCallId,
-              toolName: call.toolName,
+              id: toolCallId,
+              toolName,
             } as any)
             controller.enqueue({
               type: "tool-call",
-              toolCallId: call.toolCallId,
-              toolName: call.toolName,
-              input: JSON.stringify(call.input),
+              toolCallId,
+              toolName,
+              input: JSON.stringify(input),
               providerExecuted: false,
             } as any)
-            skipResultForIds.add(call.toolCallId)
+            skipResultForIds.add(toolCallId)
+          }
+
+          for (const call of calls) {
+            if (call.toolName === TASK_BATCH_TOOL_NAME) {
+              const tasks = taskBatchTasks(call.input)
+              for (const [index, task] of tasks.entries()) {
+                enqueueToolCall(
+                  taskBatchChildToolCallId(call.toolCallId, index),
+                  "task",
+                  task,
+                )
+              }
+              continue
+            }
+            enqueueToolCall(call.toolCallId, call.toolName, call.input)
           }
           controller.enqueue({
             type: "finish",
@@ -2466,6 +2657,10 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             clearTimeout(drainTimer)
             drainTimer = null
           }
+          if (incompleteBatchTimer) {
+            clearTimeout(incompleteBatchTimer)
+            incompleteBatchTimer = null
+          }
           if (drainBuffer.length === 0) return
           if (controllerClosed) return
           const batch = drainBuffer.splice(0, drainBuffer.length)
@@ -2475,6 +2670,34 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             toolCallIds: batch.map((c) => c.toolCallId),
           })
           finishWithToolCalls(batch)
+        }
+
+        const scheduleCompletedProxyBatchDrain = (): boolean => {
+          if (!assistantMessageStopped) return false
+          if (drainBuffer.length === 0) return false
+
+          const receivedEveryObservedCall =
+            proxyToolUseIds.size === 0 ||
+            drainBuffer.length >= proxyToolUseIds.size
+          if (!receivedEveryObservedCall) {
+            // A denied or failed MCP request may never arrive. Preserve the
+            // batch briefly, but never wait forever for a missing sibling.
+            if (!incompleteBatchTimer) {
+              incompleteBatchTimer = setTimeout(
+                drainNow,
+                PROXY_INCOMPLETE_BATCH_GRACE_MS,
+              )
+            }
+            return true
+          }
+
+          if (incompleteBatchTimer) {
+            clearTimeout(incompleteBatchTimer)
+            incompleteBatchTimer = null
+          }
+          if (drainTimer) clearTimeout(drainTimer)
+          drainTimer = setTimeout(drainNow, DRAIN_QUIET_MS)
+          return true
         }
 
         const settleResultBoundary = () => {
@@ -2589,6 +2812,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             })
             turnCompleted = false
             resetAutoContinueWindow()
+            // The `result` we just consumed marked the CLI idle; this
+            // continuation puts it back to work.
+            if (activeProcess) noteTurnStarted(activeProcess)
             proc.stdin?.write(makeAutoContinueMessage() + "\n")
             return
           }
@@ -2681,6 +2907,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               type: msg.type,
               subtype: msg.subtype,
             })
+
+            if (msg.type === "message_start") {
+              proxyToolUseIds.clear()
+              assistantMessageStopped = false
+            }
 
             // Handle system init
             if (msg.type === "system" && msg.subtype === "init") {
@@ -2908,6 +3139,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   endTextBlock()
                 } else if (tc.name.startsWith(PROXY_TOOL_PREFIX)) {
                   noteProxyActivity()
+                  proxyToolUseIds.add(tc.id)
                   log.debug("ignoring proxy tool_use block; broker handles it", {
                     name: tc.name,
                     id: tc.id,
@@ -3120,6 +3352,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     endTextBlock()
                   } else if (block.name.startsWith(PROXY_TOOL_PREFIX)) {
                     noteProxyActivity()
+                    proxyToolUseIds.add(block.id)
                     log.debug("ignoring proxy tool_use from assistant message", {
                       name: block.name,
                       id: block.id,
@@ -3172,6 +3405,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   })
                 }
               }
+
+              assistantMessageStopped = true
+              if (scheduleCompletedProxyBatchDrain()) return
             }
 
             // user message (tool results from Claude CLI)
@@ -3259,6 +3495,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   }
                 }
               }
+            }
+
+            if (gotPartialEvents && msg.type === "message_stop") {
+              assistantMessageStopped = true
+              if (scheduleCompletedProxyBatchDrain()) return
             }
 
             // result - end of conversation turn
@@ -3402,6 +3643,10 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             clearTimeout(drainTimer)
             drainTimer = null
           }
+          if (incompleteBatchTimer) {
+            clearTimeout(incompleteBatchTimer)
+            incompleteBatchTimer = null
+          }
           lineEmitter.off("line", lineHandler)
           lineEmitter.off("close", closeHandler)
           pendingProxyUnsubscribe?.()
@@ -3441,7 +3686,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           if (controllerClosed) {
             // Stream already closed (we already drained). Late arrival —
             // reject immediately so the proxy-mcp HTTP request returns
-            // instead of hanging until its 10-min timeout.
+            // instead of hanging until the 30-min proxy call timeout.
             log.warn(
               "pending proxy call arrived after stream close; rejecting",
               {
@@ -3467,17 +3712,32 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           noteToolActivity()
           drainBuffer.push(call)
           if (noteResultBoundaryCall()) return
+          if (scheduleCompletedProxyBatchDrain()) return
+          // With partial messages, message_stop is the authoritative batch
+          // boundary. Do not start the quiet-period timer while Claude may
+          // still be streaming more tool inputs.
+          if (gotPartialEvents && !assistantMessageStopped) return
           if (drainTimer) clearTimeout(drainTimer)
           drainTimer = setTimeout(drainNow, DRAIN_QUIET_MS)
         })
 
         proc.on("error", procErrorHandler)
 
-        // On abort, keep process alive for next message
+        // On abort, stop the CLI's turn but keep the process alive for the
+        // next message. Closing only our end of the stream is not enough:
+        // the CLI would run the abandoned turn to completion, still billing
+        // tokens and still executing tools, and its late output would land
+        // in whatever turn came next.
         if (options.abortSignal) {
           options.abortSignal.addEventListener("abort", () => {
             autoContinueState.aborted = true
             if (turnCompleted || controllerClosed) return
+
+            if (activeProcess) {
+              void interruptTurn(activeProcess).then((idle) => {
+                log.info("interrupt sent for aborted turn", { cwd, idle })
+              })
+            }
 
             if (!hasReceivedContent) {
               log.info(
@@ -3558,6 +3818,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         }
 
         // Send the user message for a fresh turn.
+        if (activeProcess) noteTurnStarted(activeProcess)
         proc.stdin?.write(userMsg + "\n")
         log.debug("sent user message", { textLength: userMsg.length })
         // Arm the start watchdog so a reused child that goes silent after

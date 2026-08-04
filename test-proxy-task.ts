@@ -17,8 +17,11 @@ import {
   DEFAULT_PROXY_TOOLS,
   disallowedToolFlags,
   isExpectedCleanupError,
+  resolveProxyCallTimeoutMs,
   resolveProxyClientCeilingMs,
   SERVER_CLOSED_MESSAGE,
+  CLIENT_GONE_MESSAGE,
+  TASK_BATCH_TOOL_NAME,
 } from "./src/proxy-mcp.js"
 import {
   getPendingProxyCalls,
@@ -45,6 +48,9 @@ const PARALLEL_TASK_INPUT = {
   task_id: "task-parallel",
   background: false,
 }
+const TASK_BATCH_INPUT = {
+  tasks: [TASK_INPUT, PARALLEL_TASK_INPUT],
+}
 
 function modelProxyTools(settings: { proxyTools?: string[] } = {}) {
   const provider = createClaudeCode(settings)
@@ -57,12 +63,17 @@ function modelProxyTools(settings: { proxyTools?: string[] } = {}) {
 function createFakeTaskCli(
   mode:
     | "normal"
+    | "nonpartial-batch"
     | "race"
     | "batch"
+    | "delayed-batch"
+    | "post-boundary-batch"
+    | "missing-batch-call"
     | "duplicate"
     | "error"
     | "abort"
-    | "followup",
+    | "followup"
+    | "task-batch-followup",
 ) {
   const cwd = mkdtempSync(join(tmpdir(), "opencode-proxy-task-"))
   const cliPath = join(cwd, "fake-claude.cjs")
@@ -97,6 +108,14 @@ if (!proxyUrl) {
 const mode = ${JSON.stringify(mode)}
 const taskInput = ${JSON.stringify(TASK_INPUT)}
 const secondTaskInput = ${JSON.stringify(PARALLEL_TASK_INPUT)}
+const taskBatchInput = ${JSON.stringify(TASK_BATCH_INPUT)}
+const usesTaskBatch = mode === "task-batch-followup"
+const hasSecondTask =
+  mode === "batch" ||
+  mode === "delayed-batch" ||
+  mode === "nonpartial-batch" ||
+  mode === "post-boundary-batch" ||
+  mode === "missing-batch-call"
 const assistant = {
   type: "assistant",
   session_id: "fake-session",
@@ -107,11 +126,13 @@ const assistant = {
       { type: "text", text: "I found the relevant files and will delegate the focused check." },
       {
         type: "tool_use",
-        id: "claude-proxy-task",
-        name: "mcp__opencode_proxy__task",
-        input: taskInput,
+        id: usesTaskBatch ? "claude-proxy-task-batch" : "claude-proxy-task",
+        name: usesTaskBatch
+          ? "mcp__opencode_proxy__task_batch"
+          : "mcp__opencode_proxy__task",
+        input: usesTaskBatch ? taskBatchInput : taskInput,
       },
-      ...(mode === "batch"
+      ...(hasSecondTask
         ? [{
             type: "tool_use",
             id: "claude-proxy-task-2",
@@ -136,6 +157,56 @@ function emit(message) {
   process.stdout.write(JSON.stringify(message) + "\\n")
 }
 
+function emitTaskBlock(index, id, input, toolName = "task") {
+  emit({
+    type: "stream_event",
+    session_id: "fake-session",
+    event: {
+      type: "content_block_start",
+      index,
+      content_block: {
+        type: "tool_use",
+        id,
+        name: "mcp__opencode_proxy__" + toolName,
+      },
+    },
+  })
+  emit({
+    type: "stream_event",
+    session_id: "fake-session",
+    event: {
+      type: "content_block_delta",
+      index,
+      delta: {
+        type: "input_json_delta",
+        partial_json: JSON.stringify(input),
+      },
+    },
+  })
+  emit({
+    type: "stream_event",
+    session_id: "fake-session",
+    event: { type: "content_block_stop", index },
+  })
+}
+
+function emitMessageEnd() {
+  emit({
+    type: "stream_event",
+    session_id: "fake-session",
+    event: {
+      type: "message_delta",
+      delta: { stop_reason: "end_turn" },
+    },
+  })
+  emit({
+    type: "stream_event",
+    session_id: "fake-session",
+    event: { type: "message_stop" },
+  })
+  emit(assistant)
+}
+
 function emitAssistant() {
   if (mode === "abort") {
     emit({
@@ -147,11 +218,16 @@ function emitAssistant() {
     })
     return
   }
-  if (mode === "normal") {
+  if (mode === "normal" || mode === "nonpartial-batch") {
     emit(assistant)
     return
   }
 
+  emit({
+    type: "stream_event",
+    session_id: "fake-session",
+    event: { type: "message_start" },
+  })
   emit({
     type: "stream_event",
     session_id: "fake-session",
@@ -178,45 +254,21 @@ function emitAssistant() {
     session_id: "fake-session",
     event: { type: "content_block_stop", index: 0 },
   })
-  emit({
-    type: "stream_event",
-    session_id: "fake-session",
-    event: {
-      type: "content_block_start",
-      index: 1,
-      content_block: {
-        type: "tool_use",
-        id: "claude-proxy-task",
-        name: "mcp__opencode_proxy__task",
-      },
-    },
-  })
-  emit({
-    type: "stream_event",
-    session_id: "fake-session",
-    event: {
-      type: "content_block_delta",
-      index: 1,
-      delta: {
-        type: "input_json_delta",
-        partial_json: JSON.stringify(taskInput),
-      },
-    },
-  })
-  emit({
-    type: "stream_event",
-    session_id: "fake-session",
-    event: { type: "content_block_stop", index: 1 },
-  })
-  emit({
-    type: "stream_event",
-    session_id: "fake-session",
-    event: {
-      type: "message_delta",
-      delta: { stop_reason: "end_turn" },
-    },
-  })
-  emit(assistant)
+  emitTaskBlock(
+    1,
+    usesTaskBatch ? "claude-proxy-task-batch" : "claude-proxy-task",
+    usesTaskBatch ? taskBatchInput : taskInput,
+    usesTaskBatch ? "task_batch" : "task",
+  )
+  if (mode === "delayed-batch") return
+  if (
+    mode === "batch" ||
+    mode === "post-boundary-batch" ||
+    mode === "missing-batch-call"
+  ) {
+    emitTaskBlock(2, "claude-proxy-task-2", secondTaskInput)
+  }
+  emitMessageEnd()
 }
 
 async function callTask(input = taskInput, id = 1) {
@@ -233,6 +285,20 @@ async function callTask(input = taskInput, id = 1) {
   return response.json()
 }
 
+async function callTaskBatch() {
+  const response = await fetch(proxyUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "task-batch-1",
+      method: "tools/call",
+      params: { name: "task_batch", arguments: taskBatchInput },
+    }),
+  })
+  return response.json()
+}
+
 let handled = false
 readline.createInterface({ input: process.stdin }).on("line", () => {
   if (handled) return
@@ -240,6 +306,55 @@ readline.createInterface({ input: process.stdin }).on("line", () => {
   emitAssistant()
   if (mode === "abort") {
     void callTask().catch(() => {})
+    return
+  }
+  if (mode === "task-batch-followup") {
+    void callTaskBatch()
+      .then((body) => {
+        const responseText = body.result?.content?.[0]?.text ??
+          JSON.stringify(body.error)
+        emit({
+          type: "assistant",
+          session_id: "fake-session",
+          message: {
+            role: "assistant",
+            stop_reason: "end_turn",
+            content: [{
+              type: "text",
+              text: "Batch parent received: " + responseText,
+            }],
+          },
+        })
+        emit({ ...result, num_turns: 2 })
+      })
+      .catch(() => {})
+    return
+  }
+  if (mode === "delayed-batch") {
+    void callTask().catch(() => {})
+    setTimeout(() => {
+      emitTaskBlock(2, "claude-proxy-task-2", secondTaskInput)
+      emitMessageEnd()
+      void callTask(secondTaskInput, 2).catch(() => {})
+      setTimeout(() => emit(result), 50)
+    }, 300)
+    return
+  }
+  if (mode === "post-boundary-batch") {
+    void callTask().catch(() => {})
+    setTimeout(
+      () => void callTask(secondTaskInput, 2).catch(() => {}),
+      300,
+    )
+    return
+  }
+  if (mode === "missing-batch-call") {
+    void callTask().catch(() => {})
+    return
+  }
+  if (mode === "nonpartial-batch") {
+    void callTask().catch(() => {})
+    setTimeout(() => void callTask(secondTaskInput, 2).catch(() => {}), 25)
     return
   }
   if (mode === "race") {
@@ -294,7 +409,16 @@ readline.createInterface({ input: process.stdin }).on("line", () => {
 }
 
 async function streamTaskBoundary(
-  mode: "normal" | "race" | "batch" | "duplicate" | "error",
+  mode:
+    | "normal"
+    | "nonpartial-batch"
+    | "race"
+    | "batch"
+    | "delayed-batch"
+    | "post-boundary-batch"
+    | "missing-batch-call"
+    | "duplicate"
+    | "error",
 ) {
   const fake = createFakeTaskCli(mode)
   const modelId = `claude-test-task-${mode}`
@@ -469,7 +593,13 @@ test("parent and child calls retain distinct opencode session affinity", async (
 
 test("Task proxy schema matches current opencode TaskTool fields", () => {
   const task = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "task")
+  const taskBatch = DEFAULT_PROXY_TOOLS.find(
+    (tool) => tool.name === TASK_BATCH_TOOL_NAME,
+  )
   assert.ok(task)
+  assert.ok(taskBatch)
+  assert.match(task.description, /use task_batch/)
+  assert.match(taskBatch.description, /required concurrency path/)
 
   const properties = task.inputSchema.properties as Record<
     string,
@@ -489,6 +619,59 @@ test("Task proxy schema matches current opencode TaskTool fields", () => {
     "prompt",
     "subagent_type",
   ])
+  const batchTasks = taskBatch.inputSchema.properties.tasks as Record<
+    string,
+    any
+  >
+  assert.equal(batchTasks.type, "array")
+  assert.equal(batchTasks.minItems, 2)
+  assert.deepEqual(batchTasks.items.required, task.inputSchema.required)
+  assert.deepEqual(
+    Object.keys(batchTasks.items.properties).sort(),
+    Object.keys(properties).sort(),
+  )
+  assert.deepEqual(disallowedToolFlags([taskBatch]), ["Agent"])
+  assert.deepEqual(disallowedToolFlags([task, taskBatch]), ["Agent"])
+  assert.equal(
+    resolveProxyCallTimeoutMs(TASK_BATCH_TOOL_NAME, undefined, undefined),
+    60 * 60 * 1000,
+  )
+})
+
+test("task_batch rejects malformed arrays before creating a pending call", async () => {
+  const taskBatch = DEFAULT_PROXY_TOOLS.find(
+    (tool) => tool.name === TASK_BATCH_TOOL_NAME,
+  )
+  assert.ok(taskBatch)
+  const server = await createProxyMcpServer([taskBatch])
+  let callCount = 0
+  server.calls.on("call", () => callCount++)
+
+  try {
+    for (const [index, input] of [
+      { tasks: [] },
+      { tasks: [TASK_INPUT] },
+      { tasks: [TASK_INPUT, null] },
+      {
+        tasks: [
+          TASK_INPUT,
+          { description: "Missing prompt", subagent_type: "general" },
+        ],
+      },
+    ].entries()) {
+      const response = await postRpc(server.url, {
+        jsonrpc: "2.0",
+        id: `invalid-batch-${index}`,
+        method: "tools/call",
+        params: { name: TASK_BATCH_TOOL_NAME, arguments: input },
+      })
+      assert.equal(response.body.result.isError, true)
+      assert.match(response.body.result.content[0].text, /task_batch/)
+    }
+    assert.equal(callCount, 0)
+  } finally {
+    await server.close()
+  }
 })
 
 test("proxy MCP initializes, lists Task, and resolves it through the broker", async () => {
@@ -700,6 +883,14 @@ test("normal text plus Task result closes on native tool boundary", async () => 
   assertNativeTaskBoundary(result.parts, result.pending)
 })
 
+test("non-partial parallel Task calls share one native tool boundary", async () => {
+  const result = await streamTaskBoundary("nonpartial-batch")
+  assertNativeTaskBoundary(result.parts, result.pending, [
+    TASK_INPUT,
+    PARALLEL_TASK_INPUT,
+  ])
+})
+
 test("result before delayed Task call still closes on native tool boundary", async () => {
   const result = await streamTaskBoundary("race")
   assertNativeTaskBoundary(result.parts, result.pending)
@@ -711,6 +902,27 @@ test("parallel Task calls drain in one native tool boundary", async () => {
     TASK_INPUT,
     PARALLEL_TASK_INPUT,
   ])
+})
+
+test("parallel Task calls wait for message_stop beyond the old debounce", async () => {
+  const result = await streamTaskBoundary("delayed-batch")
+  assertNativeTaskBoundary(result.parts, result.pending, [
+    TASK_INPUT,
+    PARALLEL_TASK_INPUT,
+  ])
+})
+
+test("parallel Task calls remain batched when MCP dispatch follows message_stop", async () => {
+  const result = await streamTaskBoundary("post-boundary-batch")
+  assertNativeTaskBoundary(result.parts, result.pending, [
+    TASK_INPUT,
+    PARALLEL_TASK_INPUT,
+  ])
+})
+
+test("a missing parallel MCP call does not block the calls that arrived", async () => {
+  const result = await streamTaskBoundary("missing-batch-call")
+  assertNativeTaskBoundary(result.parts, result.pending, [TASK_INPUT])
 })
 
 test("duplicate Claude results still produce one native Task completion", async () => {
@@ -919,5 +1131,324 @@ test("parent tool-result turn defers MCP hot reload and continues the same Claud
     rejectAllPendingProxyCallsForSession(sk, new Error("test cleanup"))
     deleteActiveProcess(sk)
     rmSync(fake.cwd, { recursive: true, force: true })
+  }
+})
+
+test("task_batch fans one Claude MCP call into concurrent opencode tasks", {
+  timeout: 10_000,
+}, async () => {
+  const fake = createFakeTaskCli("task-batch-followup")
+  const modelId = "claude-test-task-batch-followup"
+  const sk = sessionKey(fake.cwd, `${modelId}::tools::default`)
+
+  try {
+    const model = createClaudeCode({
+      cliPath: fake.cliPath,
+      cwd: fake.cwd,
+      bridgeOpencodeMcp: false,
+      proxyOpencodeMcpTools: false,
+      proxyTools: ["Task"],
+    }).languageModel(modelId)
+    const tools = [
+      {
+        type: "function",
+        name: "task",
+        description: "Delegate work to an opencode subagent",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ]
+    const firstPrompt = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "Delegate both checks concurrently." }],
+      },
+    ]
+    const firstResponse = await model.doStream({
+      prompt: firstPrompt,
+      tools,
+    } as any)
+    const firstParts: any[] = []
+    for await (const part of firstResponse.stream) firstParts.push(part)
+
+    const taskCalls = firstParts.filter(
+      (part) => part.type === "tool-call" && part.toolName === "task",
+    )
+    assert.equal(taskCalls.length, 2)
+    assert.deepEqual(
+      taskCalls.map((call) => JSON.parse(call.input)),
+      TASK_BATCH_INPUT.tasks,
+    )
+    assert.match(taskCalls[0].toolCallId, /_task_0$/)
+    assert.match(taskCalls[1].toolCallId, /_task_1$/)
+    for (const call of taskCalls) {
+      assert.match(call.toolCallId, /^[A-Za-z0-9_-]+$/)
+    }
+
+    const pending = getPendingProxyCalls(sk)
+    assert.equal(pending.length, 1)
+    assert.equal(pending[0].toolName, TASK_BATCH_TOOL_NAME)
+    assert.deepEqual(pending[0].input, TASK_BATCH_INPUT)
+
+    const childOutputs = ["first subagent complete", "second subagent failed"]
+    const secondResponse = await model.doStream({
+      prompt: [
+        ...firstPrompt,
+        {
+          role: "assistant",
+          content: taskCalls.map((call) => ({
+            type: "tool-call",
+            toolCallId: call.toolCallId,
+            toolName: "task",
+            input: call.input,
+          })),
+        },
+        {
+          role: "tool",
+          content: taskCalls.map((call, index) => ({
+            type: "tool-result",
+            toolCallId: call.toolCallId,
+            toolName: "task",
+            output: {
+              type: index === 0 ? "text" : "error-text",
+              value: childOutputs[index],
+            },
+          })),
+        },
+      ],
+      tools,
+    } as any)
+    const secondParts: any[] = []
+    for await (const part of secondResponse.stream) secondParts.push(part)
+
+    const continuationText = secondParts
+      .filter((part) => part.type === "text-delta")
+      .map((part) => part.delta)
+      .join("")
+    assert.match(continuationText, /^Batch parent received: /)
+    const aggregate = JSON.parse(
+      continuationText.slice("Batch parent received: ".length),
+    )
+    assert.deepEqual(
+      aggregate.results.map((result: any) => result.output),
+      childOutputs,
+    )
+    assert.deepEqual(
+      aggregate.results.map((result: any) => result.description),
+      TASK_BATCH_INPUT.tasks.map((task) => task.description),
+    )
+    assert.deepEqual(
+      aggregate.results.map((result: any) => result.isError),
+      [false, true],
+    )
+    assert.equal(getPendingProxyCalls(sk).length, 0)
+  } finally {
+    rejectAllPendingProxyCallsForSession(sk, new Error("test cleanup"))
+    deleteActiveProcess(sk)
+    rmSync(fake.cwd, { recursive: true, force: true })
+  }
+})
+
+test("task_batch reports a partial child-result turn instead of orphaning", {
+  timeout: 10_000,
+}, async () => {
+  const fake = createFakeTaskCli("task-batch-followup")
+  const modelId = "claude-test-task-batch-partial"
+  const sk = sessionKey(fake.cwd, `${modelId}::tools::default`)
+
+  try {
+    const model = createClaudeCode({
+      cliPath: fake.cliPath,
+      cwd: fake.cwd,
+      bridgeOpencodeMcp: false,
+      proxyOpencodeMcpTools: false,
+      proxyTools: ["Task"],
+    }).languageModel(modelId)
+    const tools = [{
+      type: "function",
+      name: "task",
+      description: "Delegate work to an opencode subagent",
+      inputSchema: { type: "object", properties: {} },
+    }]
+    const firstPrompt = [{
+      role: "user",
+      content: [{ type: "text", text: "Delegate both checks concurrently." }],
+    }]
+    const firstResponse = await model.doStream({ prompt: firstPrompt, tools } as any)
+    const firstParts: any[] = []
+    for await (const part of firstResponse.stream) firstParts.push(part)
+    const taskCalls = firstParts.filter(
+      (part) => part.type === "tool-call" && part.toolName === "task",
+    )
+    assert.equal(taskCalls.length, 2)
+
+    const secondResponse = await model.doStream({
+      prompt: [
+        ...firstPrompt,
+        {
+          role: "assistant",
+          content: taskCalls.map((call) => ({
+            type: "tool-call",
+            toolCallId: call.toolCallId,
+            toolName: "task",
+            input: call.input,
+          })),
+        },
+        {
+          role: "tool",
+          content: [{
+            type: "tool-result",
+            toolCallId: taskCalls[0].toolCallId,
+            toolName: "task",
+            output: { type: "text", value: "only first result arrived" },
+          }],
+        },
+      ],
+      tools,
+    } as any)
+    const secondParts: any[] = []
+    for await (const part of secondResponse.stream) secondParts.push(part)
+    const continuationText = secondParts
+      .filter((part) => part.type === "text-delta")
+      .map((part) => part.delta)
+      .join("")
+
+    assert.match(continuationText, /received 1 of 2 child results/)
+    assert.equal(getPendingProxyCalls(sk).length, 0)
+  } finally {
+    rejectAllPendingProxyCallsForSession(sk, new Error("test cleanup"))
+    deleteActiveProcess(sk)
+    rmSync(fake.cwd, { recursive: true, force: true })
+  }
+})
+
+test("a long-running proxy call flushes headers before it resolves", async () => {
+  // undici (Node's fetch, and the Claude CLI's MCP client) aborts a request
+  // that has not produced response headers within 300s — far short of the
+  // 60-minute budget a `task` subagent needs. The server must therefore
+  // commit headers as soon as the call is registered, not when it finishes.
+  const task = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "task")
+  assert.ok(task)
+
+  const server = await createProxyMcpServer([task])
+  try {
+    let pendingCall: any = null
+    const callReceived = new Promise<void>((resolve) => {
+      server.calls.once("call", (entry: any) => {
+        pendingCall = entry
+        resolve()
+      })
+    })
+
+    const url = new URL(server.url)
+    const payload = JSON.stringify({
+      jsonrpc: "2.0",
+      id: "longpoll-1",
+      method: "tools/call",
+      params: { name: "task", arguments: TASK_INPUT },
+    })
+
+    const { request } = await import("node:http")
+    const headers = await new Promise<any>((resolve, reject) => {
+      const req = request(
+        {
+          hostname: url.hostname,
+          port: url.port,
+          path: url.pathname,
+          method: "POST",
+          headers: { "content-type": "application/json" },
+        },
+        (res) => resolve(res),
+      )
+      req.on("error", reject)
+      req.end(payload)
+    })
+
+    await callReceived
+    assert.ok(pendingCall, "server should have emitted the call")
+
+    // Headers are in hand while the call is still unresolved — that is the
+    // whole point. Chunked encoding (no content-length) is what lets the
+    // heartbeat dribble keepalive bytes until the result is ready.
+    assert.equal(headers.statusCode, 200)
+    assert.equal(headers.headers["content-length"], undefined)
+    assert.equal(headers.headers["transfer-encoding"], "chunked")
+
+    // Resolving late must still produce a parseable body, even though
+    // keepalive whitespace may already precede it on the wire.
+    pendingCall.resolve({ kind: "text", text: "late but fine" })
+
+    const body = await new Promise<string>((resolve, reject) => {
+      let acc = ""
+      headers.setEncoding("utf8")
+      headers.on("data", (c: string) => (acc += c))
+      headers.on("end", () => resolve(acc))
+      headers.on("error", reject)
+    })
+
+    const parsed = JSON.parse(body)
+    assert.equal(parsed.id, "longpoll-1")
+    assert.equal(parsed.result.content[0].text, "late but fine")
+  } finally {
+    await server.close()
+  }
+})
+
+test("writeJson tolerates a body prefixed with keepalive whitespace", () => {
+  // The heartbeat writes spaces before the payload; RFC 8259 says leading
+  // whitespace is insignificant, so the client still parses it. Guard the
+  // assumption the fix rests on.
+  const parsed = JSON.parse('   \n  {"jsonrpc":"2.0","id":1,"result":{"ok":true}}')
+  assert.equal(parsed.result.ok, true)
+})
+
+test("a Claude CLI that hangs up releases its pending call immediately", async () => {
+  // Liveness backstop: without this the call sits until its per-tool deadline
+  // even though nobody is listening.
+  // Observed via the `cancel` event, because the rejection itself runs on the
+  // handler's own promise closure and is invisible from out here.
+  const task = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "task")
+  assert.ok(task)
+
+  const server = await createProxyMcpServer([task])
+  try {
+    const cancelled = new Promise<{ id: string; toolName: string }>((resolve) => {
+      server.calls.once("cancel", resolve)
+    })
+    const registered = new Promise<any>((resolve) => {
+      server.calls.once("call", resolve)
+    })
+
+    const url = new URL(server.url)
+    const { request } = await import("node:http")
+    const req = request({
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    })
+    req.on("error", () => {})
+    req.end(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "gone-1",
+        method: "tools/call",
+        params: { name: "task", arguments: TASK_INPUT },
+      }),
+    )
+
+    const entry = await registered
+    req.destroy()
+
+    const event = await cancelled
+    assert.equal(event.id, entry.id)
+    assert.equal(event.toolName, "task")
+    assert.equal(
+      isExpectedCleanupError(`${CLIENT_GONE_MESSAGE}: task`),
+      true,
+      "cleanup rejection should log at notice, not warn",
+    )
+  } finally {
+    await server.close()
   }
 })
