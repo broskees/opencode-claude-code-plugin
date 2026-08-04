@@ -182,7 +182,7 @@ The account model IDs are internally suffixed, for example `claude-sonnet-4-6@wo
 | `skipPermissions` | boolean | `true` | Pass `--dangerously-skip-permissions` to `claude`. Ignored when `proxyTools` is set — the proxy handles permissions through opencode instead. |
 | `permissionMode` | `acceptEdits` \| `auto` \| `bypassPermissions` \| `default` \| `dontAsk` \| `plan` | – | Forwarded to `claude --permission-mode`. |
 | `proxyTools` | string[] | `["Bash", "Edit", "Write", "WebFetch", "Task"]` | Claude built-in tools to route through opencode's executor + permission UI. See [Selective tool proxy](#selective-tool-proxy). |
-| `proxyToolTimeoutMs` | `Record<string, number>` | – | Per-tool proxy call deadline in ms, keyed by proxy tool name (`bash`, `task`, …). Defaults: 10 min flat, `task` → 60 min. For `bash`, the call's own `input.timeout` is honoured on top (`max(resolved, input.timeout)`). See [Selective tool proxy](#selective-tool-proxy). |
+| `proxyToolTimeoutMs` | `Record<string, number>` | – | Per-tool proxy call deadline in ms, keyed by proxy tool name (`bash`, `task`, …). Defaults: 10 min flat, `task`/`task_batch` → no deadline, `question` → 30 min. Use `0` to disable another tool's configured deadline. For `bash`, the call's own positive `input.timeout` remains the floor (`max(resolved, input.timeout)`). See [Selective tool proxy](#selective-tool-proxy). |
 | `controlRequestBehavior` | `allow` \| `deny` | `allow` | Default response when `skipPermissions: false` and Claude sends a `can_use_tool` control request. |
 | `controlRequestToolBehaviors` | `Record<string, "allow" \| "deny">` | – | Per-tool override for `can_use_tool`. Example: `{ "Bash": "deny", "Read": "allow" }`. |
 | `controlRequestDenyMessage` | string | built-in message | Message returned to Claude on a deny. |
@@ -363,14 +363,14 @@ sqlite3 ~/.local/share/opencode/opencode.db \
 
 ### Per-tool proxy timeouts
 
-Every proxied tool call has a deadline: if opencode hasn't resolved it (run the underlying tool and returned a result) within that many milliseconds, the call is rejected and Claude receives a timeout error. Deadlines are resolved per tool, most-specific layer winning:
+Most proxied tool calls have a deadline: if opencode hasn't resolved one within that many milliseconds, the call is rejected and Claude receives a timeout error. Task calls default to no deadline because subagents can legitimately run for hours and abandoned calls are already released by aborts, orphan cleanup, process replacement, and client disconnects. Deadlines are resolved per tool, most-specific layer winning:
 
 1. flat default — 10 min (matches Claude CLI's own Bash ceiling)
-2. per-tool default — **`task`: 60 min**, **`question`: 30 min**, everything else: 10 min
-3. your `proxyToolTimeoutMs` override (case-insensitive key)
+2. per-tool default — **`task`/`task_batch`: no deadline**, **`question`: 30 min**, everything else: 10 min
+3. your `proxyToolTimeoutMs` override (case-insensitive key; `0` disables the configured deadline, except a positive Bash `input.timeout` remains the floor)
 4. for `bash` only, the call's own `input.timeout` — the proxy never undercuts a build the caller explicitly asked to run long (`max(resolved, input.timeout)`)
 
-The `task` and `question` defaults are deliberately generous. Subagents routinely run 20–40 min, and a question can sit on a slow operator; under the old flat 10-minute ceiling the proxy fired mid-call, Claude believed its dispatch had failed, and the subagent's eventual result was dropped (the parent turn had already ended on the timeout error). If a `task` call *does* time out, the error tells Claude not to "schedule a wake-up" — that is a Claude Code affordance which cannot fire in this headless/proxy context, so deferring silently loses the work.
+The `task` default deliberately has no wall-clock cap. A positive `task` override remains available as an operational backstop; if it fires, the error tells Claude not to "schedule a wake-up" because that Claude Code affordance cannot fire in this headless/proxy context. Question keeps a 30-minute default because it blocks on a human form.
 
 ```json
 "options": {
@@ -381,7 +381,7 @@ The `task` and `question` defaults are deliberately generous. Subagents routinel
 
 ### Long-running proxy connections
 
-A proxied call holds its HTTP response open while opencode runs the tool. Node and Claude CLI's undici client used to cut these connections off at exactly five minutes through their 300-second header/body timeouts, even when the per-tool deadline was longer. The proxy now flushes response headers as soon as the call is registered and sends a keepalive byte every 60 seconds, so the configured `proxyToolTimeoutMs` deadline remains the actual limit.
+A proxied call holds its HTTP response open while opencode runs the tool. Node and Claude CLI's undici client used to cut these connections off at exactly five minutes through their 300-second header/body timeouts. The proxy now flushes response headers immediately and sends a keepalive byte every 60 seconds. Unlimited server-side calls use the largest positive timeout accepted by Claude's MCP client because `timeout: 0` makes the CLI reject the server configuration.
 
 ---
 
@@ -724,7 +724,7 @@ Workaround for autonomous compression: trigger it manually with `/dcp compress` 
 - No streaming of tool inputs as they're being constructed (Anthropic's `input_json_delta`); the plugin emits them once complete.
 - Raw chain-of-thought is not available. Claude 4 family models ship summarized thinking only. See [Extended thinking](#extended-thinking) for the full picture.
 - Recommended Claude Code CLI: **2.1.142+**. Older CLIs work for everything else but skip the `--thinking-display` flag, so Claude Opus 4.7 turns may render empty Thinking rows. If something breaks after a Claude Code update, the CLI version is the first thing to check.
-- **Foreground Task calls have a 60-minute proxy deadline** (configurable via [`proxyToolTimeoutMs`](#per-tool-proxy-timeouts)). A ceiling covering the longest configured deadline is written into Claude's generated HTTP MCP configuration so long-running opencode subagents are not cut off by Claude's 60-second default. For independent longer work, use `background: true` after enabling opencode's experimental background-subagent flag.
+- **Foreground Task calls have no proxy deadline by default.** A large positive ceiling is still written into Claude's generated HTTP MCP configuration because the CLI rejects `timeout: 0`; server-side liveness comes from aborts, orphan cleanup, process replacement, and client disconnects. Set a positive [`proxyToolTimeoutMs`](#per-tool-proxy-timeouts) override if you want a backstop.
 - **Subagent todos require explicit permission.** See [Subagent todos](#subagent-todos) for the rule and a working config.
 
 ---

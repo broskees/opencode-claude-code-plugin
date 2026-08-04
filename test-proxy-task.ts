@@ -19,6 +19,7 @@ import {
   isExpectedCleanupError,
   resolveProxyCallTimeoutMs,
   resolveProxyClientCeilingMs,
+  MAX_PROXY_TIMEOUT_MS,
   SERVER_CLOSED_MESSAGE,
   CLIENT_GONE_MESSAGE,
   TASK_BATCH_TOOL_NAME,
@@ -634,7 +635,7 @@ test("Task proxy schema matches current opencode TaskTool fields", () => {
   assert.deepEqual(disallowedToolFlags([task, taskBatch]), ["Agent"])
   assert.equal(
     resolveProxyCallTimeoutMs(TASK_BATCH_TOOL_NAME, undefined, undefined),
-    60 * 60 * 1000,
+    0,
   )
 })
 
@@ -685,14 +686,13 @@ test("proxy MCP initializes, lists Task, and resolves it through the broker", as
   server.calls.on("call", forwardCall)
   try {
     const generatedConfig = JSON.parse(readFileSync(server.configPath(), "utf8"))
-    // The client-side ceiling written into --mcp-config tracks the largest
-    // effective server-side deadline (task's 60-min default here), so
-    // Claude's remote-HTTP MCP client never aborts before the broker does.
+    // Task is unlimited server-side, but Claude rejects timeout:0 in the MCP
+    // config, so advertise the largest positive client ceiling instead.
     assert.equal(
       generatedConfig.mcpServers.opencode_proxy.timeout,
       resolveProxyClientCeilingMs(undefined),
     )
-    assert.equal(resolveProxyClientCeilingMs(undefined), 60 * 60 * 1000)
+    assert.equal(resolveProxyClientCeilingMs(undefined), MAX_PROXY_TIMEOUT_MS)
 
     const initialized = await postRpc(server.url, {
       jsonrpc: "2.0",
@@ -1323,8 +1323,8 @@ test("task_batch reports a partial child-result turn instead of orphaning", {
 
 test("a long-running proxy call flushes headers before it resolves", async () => {
   // undici (Node's fetch, and the Claude CLI's MCP client) aborts a request
-  // that has not produced response headers within 300s — far short of the
-  // 60-minute budget a `task` subagent needs. The server must therefore
+  // that has not produced response headers within 300s — incompatible with
+  // an unlimited `task` subagent. The server must therefore
   // commit headers as soon as the call is registered, not when it finishes.
   const task = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "task")
   assert.ok(task)

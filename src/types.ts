@@ -168,9 +168,11 @@ export interface ClaudeCodeProviderSettings {
    * receives a timeout error.
    *
    * Defaults (used when a tool is absent here): `bash`/`edit`/`write`/
-   * `webfetch` → 10 min (matches Claude CLI's Bash ceiling); `task` →
-   * 60 min (subagents routinely run 20–40 min); `question` → 30 min
-   * (operator AFK). Setting a key here replaces the default for that tool.
+   * `webfetch` → 10 min (matches Claude CLI's Bash ceiling); `task` and
+   * `task_batch` → no deadline; `question` → 30 min (operator AFK). Setting
+   * a key here replaces the default for that tool. Use `0` to disable the
+   * configured deadline; a Bash call's own positive `input.timeout` still
+   * acts as its minimum deadline.
    *
    * For `bash` specifically the call's own `input.timeout` is honoured on
    * top: the effective deadline is `max(resolved, input.timeout)`, so a

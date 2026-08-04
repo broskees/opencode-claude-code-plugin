@@ -228,18 +228,22 @@ test("resolveProxyCallTimeoutMs: unknown tool uses the flat 10-min default", () 
   )
 })
 
-test("resolveProxyCallTimeoutMs: task defaults to 60 min", () => {
-  assert.equal(resolveProxyCallTimeoutMs("task", undefined, undefined), 60 * MIN)
+test("resolveProxyCallTimeoutMs: task and task_batch default to no deadline", () => {
+  assert.equal(resolveProxyCallTimeoutMs("task", undefined, undefined), 0)
+  assert.equal(resolveProxyCallTimeoutMs("task_batch", undefined, undefined), 0)
 })
 
 test("resolveProxyClientCeilingMs covers the largest deadline", () => {
-  // No overrides: ceiling is the biggest per-tool default (task, 60 min).
-  assert.equal(resolveProxyClientCeilingMs(undefined), 60 * MIN)
-  // Overrides above the defaults raise the ceiling so Claude's HTTP MCP
-  // client never aborts before the broker deadline fires.
-  assert.equal(resolveProxyClientCeilingMs({ task: 90 * MIN }), 90 * MIN)
-  // Overrides below the defaults do not lower it.
-  assert.equal(resolveProxyClientCeilingMs({ bash: 1 * MIN }), 60 * MIN)
+  // The CLI rejects timeout:0, so an unlimited server-side tool gets the
+  // largest positive timeout Node and Claude's MCP client can represent.
+  assert.equal(resolveProxyClientCeilingMs(undefined), MAX_PROXY_TIMEOUT_MS)
+  // Both unlimited task tools need positive overrides before the client
+  // ceiling can become finite.
+  assert.equal(
+    resolveProxyClientCeilingMs({ task: 90 * MIN, task_batch: 90 * MIN }),
+    90 * MIN,
+  )
+  assert.equal(resolveProxyClientCeilingMs({ bash: 1 * MIN }), MAX_PROXY_TIMEOUT_MS)
   // Absurd values are clamped to Node's timer max.
   assert.equal(
     resolveProxyClientCeilingMs({ task: 2 ** 40 }),
@@ -286,20 +290,18 @@ test("resolveProxyCallTimeoutMs: bash input.timeout only ever raises", () => {
   )
 })
 
-test("resolveProxyCallTimeoutMs: invalid overrides are ignored", () => {
-  // 0 / negative / NaN must not replace the default — a misformed config
-  // entry should never collapse the deadline.
+test("resolveProxyCallTimeoutMs: zero disables a deadline, invalid overrides are ignored", () => {
   assert.equal(
-    resolveProxyCallTimeoutMs("task", undefined, { task: 0 }),
-    60 * MIN,
+    resolveProxyCallTimeoutMs("edit", undefined, { edit: 0 }),
+    0,
   )
   assert.equal(
     resolveProxyCallTimeoutMs("task", undefined, { task: -100 }),
-    60 * MIN,
+    0,
   )
   assert.equal(
     resolveProxyCallTimeoutMs("task", undefined, { task: NaN as any }),
-    60 * MIN,
+    0,
   )
 })
 
@@ -369,6 +371,28 @@ test("tools/call timeout uses the per-tool override and surfaces the task-specif
   }
 })
 
+test("tools/call task has no deadline by default", async () => {
+  const srv = await createProxyMcpServer(DEFAULT_PROXY_TOOLS)
+  try {
+    srv.calls.on("call", (call: ProxyToolCall) => {
+      setTimeout(() => call.resolve({ kind: "text", text: "completed" }), 80)
+    })
+    const res = await post(srv.url, {
+      jsonrpc: "2.0",
+      id: "unlimited-task-1",
+      method: "tools/call",
+      params: {
+        name: "task",
+        arguments: { description: "x", subagent_type: "gpt", prompt: "y" },
+      },
+    })
+    assert.equal(res.json.result.isError, false)
+    assert.equal(res.json.result.content[0].text, "completed")
+  } finally {
+    await srv.close()
+  }
+})
+
 test("tools/call bash timeout honours input.timeout over a shorter override", async () => {
   // Override says 40ms but the call asks for a 30s bash timeout — the
   // effective deadline must be 30s, so the call must NOT time out within a
@@ -408,9 +432,7 @@ test("question gets a 30-min default deadline (a human has to read the form)", (
 })
 
 test("resolveProxyClientCeilingMs covers the longest per-tool default", () => {
-  // The ceiling is written into Claude's --mcp-config entry; if it were
-  // below task's 60 min the client would abort before the broker resolved.
-  assert.ok(resolveProxyClientCeilingMs(undefined) >= 60 * MIN)
+  assert.equal(resolveProxyClientCeilingMs(undefined), MAX_PROXY_TIMEOUT_MS)
 })
 
 test("filterQuestionProxyByOpencodeSupport drops the def on older opencode", () => {

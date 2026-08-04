@@ -80,20 +80,17 @@ export const PROXY_TOOL_PREFIX = `mcp__${SERVER_NAME}__`
 export const PROXY_DEFAULT_TIMEOUT_MS = 10 * 60 * 1000
 
 // Per-tool default deadlines, keyed by lowercase proxy tool name. `task` and
-// `task_batch` dispatch opencode subagents that routinely run 20-40 min; the old
-// flat ceiling fired mid-subagent, made Claude believe its dispatch had
-// failed, and (because the proxy had already returned a timeout error) the
-// late subagent result was dropped on the floor -- the operator had to
-// nudge "please check now, it seems the task succeeded" (@jknlsn, live
-// session ses_0cfc0da6, 2026-07-05).
+// `task_batch` have no deadline: subagents can legitimately run for hours,
+// while aborts, orphan cleanup, process replacement, and client disconnects
+// already release abandoned calls. A positive override restores a backstop.
 //
 // `question` blocks on a human reading a TUI form, so the flat ceiling is
 // the wrong unit entirely: a question posed just before the operator steps
 // away would be rejected mid-answer. 30 min is jknlsn's original figure and
 // matches the "prefer fewer, high-signal questions" guidance in the def.
 export const PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS: Record<string, number> = {
-  task: 60 * 60 * 1000, // 60 min
-  task_batch: 60 * 60 * 1000, // 60 min
+  task: 0,
+  task_batch: 0,
   question: 30 * 60 * 1000, // 30 min
 }
 
@@ -123,7 +120,7 @@ export function resolveProxyCallTimeoutMs(
   let ms = PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS[key] ?? PROXY_DEFAULT_TIMEOUT_MS
   if (overrides) {
     const ov = lookupCaseInsensitive(overrides, key)
-    if (typeof ov === "number" && ov > 0) ms = ov
+    if (typeof ov === "number" && ov >= 0) ms = ov
   }
   if (key === "bash") {
     const requested = input?.timeout
@@ -148,8 +145,9 @@ function lookupCaseInsensitive(
  * the proxy server. Without a `timeout` there, Claude CLI's remote-HTTP MCP
  * client aborts each call at its 60-second default even while an opencode
  * subagent is still running (@broskees, PR #18). It must be >= the largest
- * server-side deadline or the client gives up before the broker does, so it
- * tracks the max of the flat default, per-tool defaults, and user overrides.
+ * server-side deadline or the client gives up before the broker does. When a
+ * server-side tool is unlimited, use the largest positive value the client
+ * and Node timers support because the CLI rejects `timeout: 0` outright.
  * (A bash call raising its own `input.timeout` above this ceiling is a known
  * edge; Claude CLI caps bash at 10 min anyway.)
  */
@@ -157,11 +155,20 @@ export function resolveProxyClientCeilingMs(
   overrides: Record<string, number> | undefined,
 ): number {
   let ms = PROXY_DEFAULT_TIMEOUT_MS
-  for (const v of Object.values(PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS)) {
-    if (v > ms) ms = v
+  for (const [toolName, defaultMs] of Object.entries(
+    PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS,
+  )) {
+    const override = overrides
+      ? lookupCaseInsensitive(overrides, toolName)
+      : undefined
+    const effectiveMs =
+      typeof override === "number" && override >= 0 ? override : defaultMs
+    if (effectiveMs === 0) return MAX_PROXY_TIMEOUT_MS
+    if (effectiveMs > ms) ms = effectiveMs
   }
   if (overrides) {
     for (const v of Object.values(overrides)) {
+      if (v === 0) return MAX_PROXY_TIMEOUT_MS
       if (typeof v === "number" && v > ms) ms = v
     }
   }
@@ -211,8 +218,8 @@ export const TASK_PROXY_NOTE =
   " files to verify a subagent type exists — invalid types fail fast with" +
   " a clear error. Foreground calls block until the subagent finishes; set" +
   " `background` to request opencode's background execution mode. Task and" +
-  " task_batch calls get a 60-minute proxy deadline by default (configurable via" +
-  " proxyToolTimeoutMs)."
+  " task_batch calls have no proxy deadline by default; set a positive" +
+  " proxyToolTimeoutMs override if you want a backstop."
 
 const AGENT_TYPES_HEADING = "Available agent types"
 
@@ -790,20 +797,22 @@ export async function createProxyMcpServer(
               input,
               timeoutOverrides,
             )
-            timer = setTimeout(() => {
-              if (!pending.has(callId)) return
-              pending.delete(callId)
-              // v0.4.13: demoted from warn to notice. Timeouts are usually
-              // permission-pending while the user is AFK — surfacing each as
-              // a yellow UI bubble produces a wall of noise on return. The
-              // file log still captures the event for diagnostics.
-              log.notice("proxy-mcp tool call timed out", {
-                callId,
-                toolName,
-                deadlineMs,
-              })
-              reject(buildProxyTimeoutError(toolName, deadlineMs))
-            }, deadlineMs)
+            if (deadlineMs > 0) {
+              timer = setTimeout(() => {
+                if (!pending.has(callId)) return
+                pending.delete(callId)
+                // v0.4.13: demoted from warn to notice. Timeouts are usually
+                // permission-pending while the user is AFK — surfacing each as
+                // a yellow UI bubble produces a wall of noise on return. The
+                // file log still captures the event for diagnostics.
+                log.notice("proxy-mcp tool call timed out", {
+                  callId,
+                  toolName,
+                  deadlineMs,
+                })
+                reject(buildProxyTimeoutError(toolName, deadlineMs))
+              }, deadlineMs)
+            }
             calls.emit("call", entry)
           },
         ).finally(() => {
