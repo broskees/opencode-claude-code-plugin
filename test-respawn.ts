@@ -1,10 +1,8 @@
 /**
  * Unit tests for the reused-process respawn path in src/session-manager.ts.
  *
- * These cover the pure helpers (`appendResumeIfNeeded`) and the
- * undefined-when-no-active-process branch of `respawnActiveProcess`. The
- * full respawn spawns a real child and is exercised live by the doStream
- * start-watchdog, not here.
+ * These cover the pure helpers (`appendResumeIfNeeded`) and the process/turn
+ * state handed across `respawnActiveProcess`.
  *
  * Usage:
  *   npx tsx --test test-respawn.ts
@@ -14,9 +12,14 @@ import { test } from "node:test"
 
 import {
   appendResumeIfNeeded,
+  deleteActiveProcess,
   respawnActiveProcess,
+  isTurnInFlight,
+  noteTurnStarted,
+  setActiveProcess,
   setClaudeSessionId,
   deleteClaudeSessionId,
+  spawnClaudeProcess,
 } from "./src/session-manager.js"
 
 test("appendResumeIfNeeded: no-op when no claude session id is known", () => {
@@ -86,4 +89,25 @@ test("respawnActiveProcess: returns undefined when no active process exists for 
     respawnActiveProcess(sk, "/usr/bin/env", ["--print"], process.cwd()),
     undefined,
   )
+})
+
+test("respawnActiveProcess preserves an in-flight turn on the replacement", () => {
+  const sk = `sk-inflight-${Date.now()}`
+  const args = ["-e", "setInterval(() => {}, 1000)"]
+  const old = spawnClaudeProcess(process.execPath, args, process.cwd(), sk)
+  setActiveProcess(sk, old)
+  noteTurnStarted(old)
+
+  try {
+    const replacement = respawnActiveProcess(
+      sk,
+      process.execPath,
+      args,
+      process.cwd(),
+    )
+    assert.ok(replacement)
+    assert.equal(isTurnInFlight(replacement), true)
+  } finally {
+    deleteActiveProcess(sk)
+  }
 })

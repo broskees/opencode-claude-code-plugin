@@ -585,6 +585,7 @@ export function respawnActiveProcess(
 ): ActiveProcess | undefined {
   const old = activeProcesses.get(sessionKey)
   if (!old) return undefined
+  const turnWasInFlight = isTurnInFlight(old)
   activeProcesses.delete(sessionKey)
   // Silence the old exit handler so it doesn't close the proxy server,
   // unlink the system-prompt file, or touch claudeSessions on its way out
@@ -594,7 +595,7 @@ export function respawnActiveProcess(
   try {
     old.proc.kill()
   } catch {}
-  return spawnClaudeProcess(
+  const replacement = spawnClaudeProcess(
     cliPath,
     appendResumeIfNeeded(sessionKey, cliArgs),
     cwd,
@@ -604,6 +605,11 @@ export function respawnActiveProcess(
     old.systemPromptFile,
     ignoreAnthropicApiKey,
   )
+  // The start watchdog respawns in the middle of the same logical turn and
+  // immediately re-sends its envelope. Turn state is keyed by ActiveProcess,
+  // so the replacement must inherit the old process's in-flight marker.
+  if (turnWasInFlight) noteTurnStarted(replacement)
+  return replacement
 }
 
 export function buildCliArgs(opts: {
