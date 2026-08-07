@@ -2,6 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -67,8 +68,8 @@ function createFakeTaskCli(
     | "nonpartial-batch"
     | "race"
     | "batch"
-    | "delayed-batch"
-    | "post-boundary-batch"
+    | "delayed-message-stop"
+    | "late-independent-call"
     | "missing-batch-call"
     | "duplicate"
     | "error"
@@ -78,6 +79,7 @@ function createFakeTaskCli(
 ) {
   const cwd = mkdtempSync(join(tmpdir(), "opencode-proxy-task-"))
   const cliPath = join(cwd, "fake-claude.cjs")
+  const messageStopMarker = join(cwd, "message-stop-emitted")
   const source = `#!/usr/bin/env node
 const fs = require("node:fs")
 const readline = require("node:readline")
@@ -107,15 +109,15 @@ if (!proxyUrl) {
 }
 
 const mode = ${JSON.stringify(mode)}
+const messageStopMarker = ${JSON.stringify(messageStopMarker)}
 const taskInput = ${JSON.stringify(TASK_INPUT)}
 const secondTaskInput = ${JSON.stringify(PARALLEL_TASK_INPUT)}
 const taskBatchInput = ${JSON.stringify(TASK_BATCH_INPUT)}
 const usesTaskBatch = mode === "task-batch-followup"
 const hasSecondTask =
   mode === "batch" ||
-  mode === "delayed-batch" ||
+  mode === "late-independent-call" ||
   mode === "nonpartial-batch" ||
-  mode === "post-boundary-batch" ||
   mode === "missing-batch-call"
 const assistant = {
   type: "assistant",
@@ -200,6 +202,7 @@ function emitMessageEnd() {
       delta: { stop_reason: "end_turn" },
     },
   })
+  fs.writeFileSync(messageStopMarker, "")
   emit({
     type: "stream_event",
     session_id: "fake-session",
@@ -261,10 +264,9 @@ function emitAssistant() {
     usesTaskBatch ? taskBatchInput : taskInput,
     usesTaskBatch ? "task_batch" : "task",
   )
-  if (mode === "delayed-batch") return
+  if (mode === "delayed-message-stop") return
   if (
     mode === "batch" ||
-    mode === "post-boundary-batch" ||
     mode === "missing-batch-call"
   ) {
     emitTaskBlock(2, "claude-proxy-task-2", secondTaskInput)
@@ -331,17 +333,15 @@ readline.createInterface({ input: process.stdin }).on("line", () => {
       .catch(() => {})
     return
   }
-  if (mode === "delayed-batch") {
+  if (mode === "delayed-message-stop") {
     void callTask().catch(() => {})
     setTimeout(() => {
-      emitTaskBlock(2, "claude-proxy-task-2", secondTaskInput)
       emitMessageEnd()
-      void callTask(secondTaskInput, 2).catch(() => {})
       setTimeout(() => emit(result), 50)
     }, 300)
     return
   }
-  if (mode === "post-boundary-batch") {
+  if (mode === "late-independent-call") {
     void callTask().catch(() => {})
     setTimeout(
       () => void callTask(secondTaskInput, 2).catch(() => {}),
@@ -406,7 +406,7 @@ readline.createInterface({ input: process.stdin }).on("line", () => {
 `
   writeFileSync(cliPath, source)
   chmodSync(cliPath, 0o755)
-  return { cliPath, cwd }
+  return { cliPath, cwd, messageStopMarker }
 }
 
 async function streamTaskBoundary(
@@ -415,8 +415,8 @@ async function streamTaskBoundary(
     | "nonpartial-batch"
     | "race"
     | "batch"
-    | "delayed-batch"
-    | "post-boundary-batch"
+    | "delayed-message-stop"
+    | "late-independent-call"
     | "missing-batch-call"
     | "duplicate"
     | "error",
@@ -455,6 +455,7 @@ async function streamTaskBoundary(
     return {
       parts,
       pending: getPendingProxyCalls(sk).map((call) => ({ ...call })),
+      messageStopEmitted: existsSync(fake.messageStopMarker),
     }
   } finally {
     for (const call of getPendingProxyCalls(sk)) {
@@ -904,20 +905,121 @@ test("parallel Task calls drain in one native tool boundary", async () => {
   ])
 })
 
-test("parallel Task calls wait for message_stop beyond the old debounce", async () => {
-  const result = await streamTaskBoundary("delayed-batch")
-  assertNativeTaskBoundary(result.parts, result.pending, [
-    TASK_INPUT,
-    PARALLEL_TASK_INPUT,
-  ])
+test("a proxy call surfaces before Claude emits message_stop", async () => {
+  const result = await streamTaskBoundary("delayed-message-stop")
+  assertNativeTaskBoundary(result.parts, result.pending, [TASK_INPUT])
+  assert.equal(result.messageStopEmitted, false)
 })
 
-test("parallel Task calls remain batched when MCP dispatch follows message_stop", async () => {
-  const result = await streamTaskBoundary("post-boundary-batch")
-  assertNativeTaskBoundary(result.parts, result.pending, [
-    TASK_INPUT,
-    PARALLEL_TASK_INPUT,
-  ])
+test("a proxy call arriving after stream close surfaces on the tool-result turn", {
+  timeout: 10_000,
+}, async () => {
+  const fake = createFakeTaskCli("late-independent-call")
+  const modelId = "claude-test-task-late-independent-call"
+  const sk = sessionKey(fake.cwd, `${modelId}::tools::default`)
+  const brokerCalls = waitForBrokerCalls(sk, 2)
+
+  try {
+    const model = createClaudeCode({
+      cliPath: fake.cliPath,
+      cwd: fake.cwd,
+      bridgeOpencodeMcp: false,
+      proxyOpencodeMcpTools: false,
+      proxyTools: ["Task"],
+    }).languageModel(modelId)
+    const tools = [
+      {
+        type: "function",
+        name: "task",
+        description: "Delegate work to an opencode subagent",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ]
+    const firstPrompt = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "Delegate both provider checks." }],
+      },
+    ]
+    const firstResponse = await model.doStream({
+      prompt: firstPrompt,
+      tools,
+    } as any)
+    const firstParts: any[] = []
+    for await (const part of firstResponse.stream) firstParts.push(part)
+    const firstCall = firstParts.find(
+      (part) => part.type === "tool-call" && part.toolName === "task",
+    )
+    assert.ok(firstCall)
+    assert.deepEqual(JSON.parse(firstCall.input), TASK_INPUT)
+
+    await brokerCalls
+    assert.equal(getPendingProxyCalls(sk).length, 2)
+
+    const secondResponse = await model.doStream({
+      prompt: [
+        ...firstPrompt,
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: firstCall.toolCallId,
+              toolName: "task",
+              input: firstCall.input,
+            },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: firstCall.toolCallId,
+              toolName: "task",
+              output: { type: "text", value: "first subagent complete" },
+            },
+          ],
+        },
+      ],
+      tools,
+    } as any)
+    const secondParts: any[] = []
+    let replayTimeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        (async () => {
+          for await (const part of secondResponse.stream) secondParts.push(part)
+        })(),
+        new Promise((_, reject) => {
+          replayTimeout = setTimeout(
+            () => reject(new Error("late proxy call was not surfaced")),
+            2_000,
+          )
+        }),
+      ])
+    } finally {
+      if (replayTimeout) clearTimeout(replayTimeout)
+    }
+
+    const replayedCalls = secondParts.filter(
+      (part) => part.type === "tool-call" && part.toolName === "task",
+    )
+    assert.equal(replayedCalls.length, 1)
+    assert.deepEqual(JSON.parse(replayedCalls[0].input), PARALLEL_TASK_INPUT)
+    assert.equal(replayedCalls[0].providerExecuted, false)
+    const finishes = secondParts.filter((part) => part.type === "finish")
+    assert.equal(finishes.length, 1)
+    assert.equal(finishes[0].finishReason.unified, "tool-calls")
+    assert.deepEqual(
+      getPendingProxyCalls(sk).map((call) => call.input),
+      [PARALLEL_TASK_INPUT],
+    )
+  } finally {
+    rejectAllPendingProxyCallsForSession(sk, new Error("test cleanup"))
+    deleteActiveProcess(sk)
+    rmSync(fake.cwd, { recursive: true, force: true })
+  }
 })
 
 test("a missing parallel MCP call does not block the calls that arrived", async () => {
@@ -1094,6 +1196,16 @@ test("parent tool-result turn defers MCP hot reload and continues the same Claud
               toolCallId: taskCall.toolCallId,
               toolName: "task",
               input: taskCall.input,
+            },
+            {
+              type: "tool-call",
+              toolCallId: unmatchedToolCallId,
+              toolName: "task",
+              input: JSON.stringify({
+                description: "Parallel sibling",
+                prompt: "Keep running until a later tool-result turn.",
+                subagent_type: "explore",
+              }),
             },
           ],
         },

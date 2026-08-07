@@ -227,7 +227,6 @@ const AUTO_CONTINUE_MAX_ATTEMPTS = 8
 const AUTO_CONTINUE_MAX_ELAPSED_MS = 10 * 60 * 1000
 const AUTO_CONTINUE_NO_PROGRESS_LIMIT = 2
 const PROXY_RESULT_BOUNDARY_GRACE_MS = 250
-const PROXY_INCOMPLETE_BATCH_GRACE_MS = 2_000
 
 const AUTO_CONTINUE_PROMPT =
   "Continue the task from where you stopped. Do not summarize; keep working until the requested task is complete, you need clarification, or you hit a real blocker."
@@ -1047,6 +1046,28 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         2,
       ),
     }
+  }
+
+  private wasPendingProxyCallEmitted(
+    prompt: LanguageModelV3CallOptions["prompt"],
+    call: PendingProxyCall,
+  ): boolean {
+    const toolCallIds =
+      call.toolName === TASK_BATCH_TOOL_NAME
+        ? taskBatchTasks(call.input).map((_, index) =>
+            taskBatchChildToolCallId(call.toolCallId, index),
+          )
+        : [call.toolCallId]
+
+    return prompt.some(
+      (message) =>
+        message.role === "assistant" &&
+        Array.isArray(message.content) &&
+        message.content.some(
+          (part: any) =>
+            part.type === "tool-call" && toolCallIds.includes(part.toolCallId),
+        ),
+    )
   }
 
   /**
@@ -2590,14 +2611,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             usage?: ClaudeStreamMessage["usage"]
           } = {}
 
-        // Claude can stream large parallel tool inputs many seconds apart.
-        // Hold proxy calls until the assistant message is complete, then use
-        // the short quiet period only to absorb MCP scheduling jitter.
+        // End the provider turn as soon as Claude invokes a proxy tool so
+        // opencode can execute it and unblock the CLI's pending MCP request.
+        // True concurrent subagents use task_batch and arrive as one call.
         const drainBuffer: PendingProxyCall[] = []
-        const proxyToolUseIds = new Set<string>()
-        let assistantMessageStopped = false
         let drainTimer: ReturnType<typeof setTimeout> | null = null
-        let incompleteBatchTimer: ReturnType<typeof setTimeout> | null = null
         const DRAIN_QUIET_MS = 100
 
         const finishWithToolCalls = (calls: PendingProxyCall[]) => {
@@ -2657,10 +2675,6 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             clearTimeout(drainTimer)
             drainTimer = null
           }
-          if (incompleteBatchTimer) {
-            clearTimeout(incompleteBatchTimer)
-            incompleteBatchTimer = null
-          }
           if (drainBuffer.length === 0) return
           if (controllerClosed) return
           const batch = drainBuffer.splice(0, drainBuffer.length)
@@ -2670,34 +2684,6 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             toolCallIds: batch.map((c) => c.toolCallId),
           })
           finishWithToolCalls(batch)
-        }
-
-        const scheduleCompletedProxyBatchDrain = (): boolean => {
-          if (!assistantMessageStopped) return false
-          if (drainBuffer.length === 0) return false
-
-          const receivedEveryObservedCall =
-            proxyToolUseIds.size === 0 ||
-            drainBuffer.length >= proxyToolUseIds.size
-          if (!receivedEveryObservedCall) {
-            // A denied or failed MCP request may never arrive. Preserve the
-            // batch briefly, but never wait forever for a missing sibling.
-            if (!incompleteBatchTimer) {
-              incompleteBatchTimer = setTimeout(
-                drainNow,
-                PROXY_INCOMPLETE_BATCH_GRACE_MS,
-              )
-            }
-            return true
-          }
-
-          if (incompleteBatchTimer) {
-            clearTimeout(incompleteBatchTimer)
-            incompleteBatchTimer = null
-          }
-          if (drainTimer) clearTimeout(drainTimer)
-          drainTimer = setTimeout(drainNow, DRAIN_QUIET_MS)
-          return true
         }
 
         const settleResultBoundary = () => {
@@ -2907,11 +2893,6 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               type: msg.type,
               subtype: msg.subtype,
             })
-
-            if (msg.type === "message_start") {
-              proxyToolUseIds.clear()
-              assistantMessageStopped = false
-            }
 
             // Handle system init
             if (msg.type === "system" && msg.subtype === "init") {
@@ -3139,7 +3120,6 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   endTextBlock()
                 } else if (tc.name.startsWith(PROXY_TOOL_PREFIX)) {
                   noteProxyActivity()
-                  proxyToolUseIds.add(tc.id)
                   log.debug("ignoring proxy tool_use block; broker handles it", {
                     name: tc.name,
                     id: tc.id,
@@ -3352,7 +3332,6 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     endTextBlock()
                   } else if (block.name.startsWith(PROXY_TOOL_PREFIX)) {
                     noteProxyActivity()
-                    proxyToolUseIds.add(block.id)
                     log.debug("ignoring proxy tool_use from assistant message", {
                       name: block.name,
                       id: block.id,
@@ -3405,9 +3384,6 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   })
                 }
               }
-
-              assistantMessageStopped = true
-              if (scheduleCompletedProxyBatchDrain()) return
             }
 
             // user message (tool results from Claude CLI)
@@ -3495,11 +3471,6 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   }
                 }
               }
-            }
-
-            if (gotPartialEvents && msg.type === "message_stop") {
-              assistantMessageStopped = true
-              if (scheduleCompletedProxyBatchDrain()) return
             }
 
             // result - end of conversation turn
@@ -3643,10 +3614,6 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             clearTimeout(drainTimer)
             drainTimer = null
           }
-          if (incompleteBatchTimer) {
-            clearTimeout(incompleteBatchTimer)
-            incompleteBatchTimer = null
-          }
           lineEmitter.off("line", lineHandler)
           lineEmitter.off("close", closeHandler)
           pendingProxyUnsubscribe?.()
@@ -3684,22 +3651,15 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
 
         pendingProxyUnsubscribe = onPendingProxyCall(sk, (call) => {
           if (controllerClosed) {
-            // Stream already closed (we already drained). Late arrival —
-            // reject immediately so the proxy-mcp HTTP request returns
-            // instead of hanging until the 30-min proxy call timeout.
-            log.warn(
-              "pending proxy call arrived after stream close; rejecting",
+            // The following tool-result turn will surface this call if it was
+            // not part of the boundary that just closed.
+            log.info(
+              "pending proxy call arrived after stream close; leaving pending",
               {
                 sessionKey: sk,
                 toolCallId: call.toolCallId,
                 toolName: call.toolName,
               },
-            )
-            rejectPendingProxyCallById(
-              call.toolCallId,
-              new Error(
-                `Pending proxy call '${call.toolName}' arrived after the stream was already closed`,
-              ),
             )
             return
           }
@@ -3712,11 +3672,6 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           noteToolActivity()
           drainBuffer.push(call)
           if (noteResultBoundaryCall()) return
-          if (scheduleCompletedProxyBatchDrain()) return
-          // With partial messages, message_stop is the authoritative batch
-          // boundary. Do not start the quiet-period timer while Claude may
-          // still be streaming more tool inputs.
-          if (gotPartialEvents && !assistantMessageStopped) return
           if (drainTimer) clearTimeout(drainTimer)
           drainTimer = setTimeout(drainNow, DRAIN_QUIET_MS)
         })
@@ -3788,16 +3743,22 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 toolName: call.toolName,
               })
               resolvePendingProxyCallById(call.toolCallId, result)
-            } else {
-              log.info(
-                "leaving unmatched parallel proxy call pending",
-                {
-                  sessionKey: sk,
-                  toolCallId: call.toolCallId,
-                  toolName: call.toolName,
-                },
-              )
             }
+          }
+          const unreportedPendingCalls = getPendingProxyCalls(sk).filter(
+            (call) => !self.wasPendingProxyCallEmitted(options.prompt, call),
+          )
+          if (unreportedPendingCalls.length > 0) {
+            log.info(
+              "surfacing proxy calls that arrived after the previous stream closed",
+              {
+                sessionKey: sk,
+                toolCallIds: unreportedPendingCalls.map(
+                  (call) => call.toolCallId,
+                ),
+              },
+            )
+            finishWithToolCalls(unreportedPendingCalls)
           }
           return
         }
