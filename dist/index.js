@@ -5842,9 +5842,9 @@ function defineModel(opts) {
 }
 var haikuCost = { input: 1e-6, output: 5e-6, cacheRead: 1e-7, cacheWrite: 125e-8 };
 var sonnetCost = { input: 3e-6, output: 15e-6, cacheRead: 3e-7, cacheWrite: 375e-8 };
-var sonnet5Cost = { input: 2e-6, output: 1e-5, cacheRead: 2e-7, cacheWrite: 25e-7 };
 var opusCost = { input: 5e-6, output: 25e-6, cacheRead: 5e-7, cacheWrite: 625e-8 };
 var fableCost = { input: 1e-5, output: 5e-5, cacheRead: 1e-6, cacheWrite: 125e-7 };
+var fable51Cost = { ...fableCost, cacheRead: 25e-8 };
 function toConfigModel(model) {
   const inputMods = [];
   const outputMods = [];
@@ -5918,8 +5918,8 @@ var defaultModels = {
     reasoning: true,
     context: 1e6,
     output: 128e3,
-    cost: sonnet5Cost,
-    multiplier: 2,
+    cost: sonnetCost,
+    multiplier: 3,
     releaseDate: "2026-06-30"
   }),
   "claude-opus-4-5": defineModel({
@@ -5987,6 +5987,17 @@ var defaultModels = {
     cost: fableCost,
     multiplier: 10,
     releaseDate: "2026-06-09"
+  }),
+  "claude-fable-5-1": defineModel({
+    id: "claude-fable-5-1",
+    name: "Claude Fable 5.1",
+    family: "fable",
+    reasoning: true,
+    context: 1e6,
+    output: 128e3,
+    cost: fable51Cost,
+    multiplier: 10,
+    releaseDate: "2026-09-01"
   }),
   // Mythos 5 shares Fable 5's capabilities and pricing without the safety
   // classifiers; limited availability via Project Glasswing. `claude --model

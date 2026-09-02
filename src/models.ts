@@ -31,10 +31,9 @@ function defineModel(opts: {
   releaseDate: string
   // List-price multiplier relative to Haiku (the cheapest model). Derived
   // exactly from published per-token pricing: input AND output ratios both come
-  // out to haiku 1, sonnet 3, opus 5, fable/mythos 10. Sonnet 5 is temporarily
-  // 2x during its launch-price period through August 31, 2026. Rendered as an
-  // `(N×)` suffix so it surfaces in opencode's model picker, which has no
-  // dedicated multiplier field.
+  // out to haiku 1, sonnet 3, opus 5, fable/mythos 10. Rendered as an `(N×)`
+  // suffix so it surfaces in opencode's model picker, which has no dedicated
+  // multiplier field.
   // Display-only: model resolution keys off `id`.
   multiplier: number
   status?: OpenCodeModel["status"]
@@ -72,16 +71,14 @@ function defineModel(opts: {
 // one. Verified against the pricing docs 2026-07-26.
 const haikuCost = { input: 1e-6, output: 5e-6, cacheRead: 1e-7, cacheWrite: 1.25e-6 }
 const sonnetCost = { input: 3e-6, output: 15e-6, cacheRead: 3e-7, cacheWrite: 3.75e-6 }
-// Introductory pricing through August 31, 2026. Standard pricing from September
-// 1 is the same $3/M input and $15/M output as the other Sonnet models.
-const sonnet5Cost = { input: 2e-6, output: 10e-6, cacheRead: 2e-7, cacheWrite: 2.5e-6 }
 // Opus 4.5+ standard pricing is $5/M in, $25/M out (the price cut at 4.5; held
 // through 4.6/4.7/4.8/5). Cache read 0.1x input, cache write 1.25x input.
 const opusCost = { input: 5e-6, output: 25e-6, cacheRead: 0.5e-6, cacheWrite: 6.25e-6 }
-// Fable 5 and Mythos 5 are the Mythos-class tier above Opus and share pricing
-// ($10/M in, $50/M out). Cache read/write follow Anthropic's standard 0.1x / 1.25x
-// input ratios (not separately published).
+// Fable and Mythos are the tier above Opus at $10/M in and $50/M out.
 const fableCost = { input: 10e-6, output: 50e-6, cacheRead: 1e-6, cacheWrite: 12.5e-6 }
+// Fable 5.1 keeps the same base and cache-write prices, but cuts cache reads
+// from $1/M to $0.25/M.
+const fable51Cost = { ...fableCost, cacheRead: 0.25e-6 }
 
 /**
  * Convert an OpenCodeModel to the flat config schema that OpenCode's
@@ -166,8 +163,8 @@ export const defaultModels: Record<string, OpenCodeModel> = {
     reasoning: true,
     context: 1_000_000,
     output: 128_000,
-    cost: sonnet5Cost,
-    multiplier: 2,
+    cost: sonnetCost,
+    multiplier: 3,
     releaseDate: "2026-06-30",
   }),
   "claude-opus-4-5": defineModel({
@@ -235,6 +232,17 @@ export const defaultModels: Record<string, OpenCodeModel> = {
     cost: fableCost,
     multiplier: 10,
     releaseDate: "2026-06-09",
+  }),
+  "claude-fable-5-1": defineModel({
+    id: "claude-fable-5-1",
+    name: "Claude Fable 5.1",
+    family: "fable",
+    reasoning: true,
+    context: 1_000_000,
+    output: 128_000,
+    cost: fable51Cost,
+    multiplier: 10,
+    releaseDate: "2026-09-01",
   }),
   // Mythos 5 shares Fable 5's capabilities and pricing without the safety
   // classifiers; limited availability via Project Glasswing. `claude --model
